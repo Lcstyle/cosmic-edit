@@ -235,6 +235,7 @@ pub enum Action {
     ToggleLineNumbers,
     ToggleProjectSearch,
     ToggleSettingsPage,
+    ListMatchesSelection,
     ToggleWordWrap,
     Undo,
     ZoomIn,
@@ -287,6 +288,7 @@ impl Action {
             Self::ToggleLineNumbers => Message::ToggleLineNumbers,
             Self::ToggleProjectSearch => Message::ToggleContextPage(ContextPage::ProjectSearch),
             Self::ToggleSettingsPage => Message::ToggleContextPage(ContextPage::Settings),
+            Self::ListMatchesSelection => Message::ListMatchesSelection,
             Self::ToggleWordWrap => Message::ToggleWordWrap,
             Self::Undo => Message::Undo,
             Self::ZoomIn => Message::ZoomIn,
@@ -365,7 +367,10 @@ pub enum Message {
     FindUseRegex(bool),
     FindWrapAround(bool),
     FindListMatches(bool),
+    ListMatchesSelection,
     OpenDocumentSearchResult(usize),
+    OpenDocumentSearchWindow(window::Id),
+    CloseDocumentSearchWindow,
     CopyMatchesToNewFile,
     CopyMatchesToClipboard,
     Focus(window::Id),
@@ -443,7 +448,6 @@ pub enum Message {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContextPage {
     About,
-    DocumentMatches,
     DocumentStatistics,
     GitManagement,
     //TODO: Move search to pop-up
@@ -501,6 +505,7 @@ pub struct App {
     project_search_value: String,
     project_search_result: Option<ProjectSearchResult>,
     document_search_result: Option<DocumentSearchResult>,
+    document_search_window: Option<window::Id>,
     watcher_opt: Option<(
         notify::RecommendedWatcher,
         HashSet<(PathBuf, RecursiveMode)>,
@@ -1821,71 +1826,6 @@ impl App {
             .into()
     }
 
-    fn document_matches(&self) -> Element<'_, Message> {
-        let spacing = self.core().system_theme().cosmic().spacing;
-
-        let items = match &self.document_search_result {
-            Some(result) if !result.lines.is_empty() => {
-                let mut items = Vec::with_capacity(result.lines.len() + 3);
-
-                // Header with match count
-                items.push(
-                    widget::text::body(format!(
-                        "{} matches in {}",
-                        result.lines.len(),
-                        result.document_title
-                    )).into()
-                );
-
-                // Action buttons row
-                items.push(
-                    widget::row::with_children(vec![
-                        widget::button::standard(fl!("copy-to-new-file"))
-                            .on_press(Message::CopyMatchesToNewFile)
-                            .into(),
-                        widget::button::standard(fl!("copy-to-clipboard"))
-                            .on_press(Message::CopyMatchesToClipboard)
-                            .into(),
-                    ])
-                    .spacing(spacing.space_xs)
-                    .into()
-                );
-
-                // Results list
-                let line_number_width = result.lines.last()
-                    .map(|l| l.number.to_string().len())
-                    .unwrap_or(1);
-
-                for (i, line_match) in result.lines.iter().enumerate() {
-                    items.push(
-                        widget::button::custom(
-                            widget::row::with_children(vec![
-                                widget::text(format!("{:>width$}", line_match.number, width = line_number_width))
-                                    .font(Font::MONOSPACE)
-                                    .into(),
-                                widget::text(&line_match.text)
-                                    .font(Font::MONOSPACE)
-                                    .into(),
-                            ])
-                            .spacing(spacing.space_xs),
-                        )
-                        .on_press(Message::OpenDocumentSearchResult(i))
-                        .width(Length::Fill)
-                        .class(theme::Button::AppletMenu)
-                        .into(),
-                    );
-                }
-                items
-            }
-            _ => vec![widget::text::body(fl!("no-matches")).into()],
-        };
-
-        widget::column::with_children(items)
-            .spacing(spacing.space_s)
-            .padding([spacing.space_xxs, spacing.space_none])
-            .into()
-    }
-
     fn settings(&self) -> Element<'_, Message> {
         let app_theme_selected = match self.config.app_theme {
             AppTheme::Dark => 1,
@@ -2116,6 +2056,7 @@ impl Application for App {
             project_search_value: String::new(),
             project_search_result: None,
             document_search_result: None,
+            document_search_window: None,
             watcher_opt: None,
             modifiers: Modifiers::empty(),
             session_id: hotexit::generate_session_id(),
@@ -2573,6 +2514,11 @@ impl Application for App {
                 if Some(window_id) == self.core.main_window_id() {
                     return self.update(Message::Quit);
                 }
+                // Handle document search window close
+                if self.document_search_window == Some(window_id) {
+                    self.document_search_window = None;
+                    return window::close(window_id);
+                }
             }
             Message::Copy => {
                 if let Some(Tab::Editor(tab)) = self.active_tab() {
@@ -2701,15 +2647,34 @@ impl Application for App {
                         match self.config.find_regex(&self.find_search_value) {
                             Ok(regex) => {
                                 if self.config.find_list_matches {
-                                    // List all matching lines
+                                    // List all matching lines in a resizable window
                                     let matches = tab.search_all_matches(&regex);
                                     self.document_search_result = Some(DocumentSearchResult {
                                         pattern: self.find_search_value.clone(),
                                         document_title: tab.title(),
                                         lines: matches,
                                     });
-                                    self.context_page = ContextPage::DocumentMatches;
-                                    self.core.window.show_context = true;
+                                    // Close existing window if any
+                                    if let Some(old_id) = self.document_search_window.take() {
+                                        // Just close it, will open new one
+                                        let _ = window::close::<Message>(old_id);
+                                    }
+                                    // Open new window
+                                    let window_settings = window::Settings {
+                                        size: iced::Size::new(900.0, 600.0),
+                                        min_size: Some(iced::Size::new(400.0, 200.0)),
+                                        resizable: true,
+                                        decorations: true,
+                                        ..Default::default()
+                                    };
+                                    let (id, spawn_task) = window::open(window_settings);
+                                    self.document_search_window = Some(id);
+                                    return spawn_task.then(move |_| {
+                                        Task::perform(
+                                            async move { action::app(Message::OpenDocumentSearchWindow(id)) },
+                                            |x| x,
+                                        )
+                                    });
                                 } else {
                                     tab.search(&regex, true, self.config.find_wrap_around);
                                 }
@@ -2828,6 +2793,59 @@ impl Application for App {
                 config_set!(find_list_matches, find_list_matches);
                 return self.update_config();
             }
+            Message::ListMatchesSelection => {
+                // Get selected text from active tab
+                if let Some(Tab::Editor(tab)) = self.active_tab() {
+                    let editor = tab.editor.lock().unwrap();
+                    if let Some(selected_text) = editor.copy_selection() {
+                        drop(editor); // Release lock before updating
+                        // Set the search value to the selected text
+                        self.find_search_value = selected_text.trim().to_string();
+                        if !self.find_search_value.is_empty() {
+                            // Trigger list matches search
+                            if let Some(Tab::Editor(tab)) = self.active_tab() {
+                                match self.config.find_regex(&self.find_search_value) {
+                                    Ok(regex) => {
+                                        let matches = tab.search_all_matches(&regex);
+                                        self.document_search_result = Some(DocumentSearchResult {
+                                            pattern: self.find_search_value.clone(),
+                                            document_title: tab.title(),
+                                            lines: matches,
+                                        });
+                                        // Close existing window if any
+                                        if let Some(old_id) = self.document_search_window.take() {
+                                            let _ = window::close::<Message>(old_id);
+                                        }
+                                        // Open new window
+                                        let window_settings = window::Settings {
+                                            size: iced::Size::new(900.0, 600.0),
+                                            min_size: Some(iced::Size::new(400.0, 200.0)),
+                                            resizable: true,
+                                            decorations: true,
+                                            ..Default::default()
+                                        };
+                                        let (id, spawn_task) = window::open(window_settings);
+                                        self.document_search_window = Some(id);
+                                        return spawn_task.then(move |_| {
+                                            Task::perform(
+                                                async move { action::app(Message::OpenDocumentSearchWindow(id)) },
+                                                |x| x,
+                                            )
+                                        });
+                                    }
+                                    Err(err) => {
+                                        log::warn!(
+                                            "failed to compile regex {:?}: {}",
+                                            self.find_search_value,
+                                            err
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Message::OpenDocumentSearchResult(line_i) => {
                 if let Some(result) = &self.document_search_result {
                     if let Some(line_match) = result.lines.get(line_i) {
@@ -2844,6 +2862,14 @@ impl Application for App {
                             self.update_tab(),
                         ]);
                     }
+                }
+            }
+            Message::OpenDocumentSearchWindow(_id) => {
+                // Window has been opened, nothing else to do
+            }
+            Message::CloseDocumentSearchWindow => {
+                if let Some(id) = self.document_search_window.take() {
+                    return window::close(id);
                 }
             }
             Message::CopyMatchesToNewFile => {
@@ -3970,11 +3996,6 @@ impl Application for App {
                 |s| Message::LaunchUrl(s.to_string()),
                 Message::ToggleContextPage(ContextPage::About),
             ),
-            ContextPage::DocumentMatches => context_drawer::context_drawer(
-                self.document_matches(),
-                Message::ToggleContextPage(ContextPage::DocumentMatches),
-            )
-            .title(fl!("matching-lines")),
             ContextPage::DocumentStatistics => context_drawer::context_drawer(
                 self.document_statistics(),
                 Message::ToggleContextPage(ContextPage::DocumentStatistics),
@@ -4292,6 +4313,90 @@ impl Application for App {
     }
 
     fn view_window(&self, window_id: window::Id) -> Element<'_, Message> {
+        // Check if this is the document search window
+        if self.document_search_window == Some(window_id) {
+            let spacing = self.core().system_theme().cosmic().spacing;
+
+            let content: Element<'_, Message> = match &self.document_search_result {
+                Some(result) => {
+                    let line_number_width = result.lines.last()
+                        .map(|l| l.number.to_string().len())
+                        .unwrap_or(1);
+
+                    // Title bar with info
+                    let title = widget::text::heading(format!(
+                        "{} matches for \"{}\" in {}",
+                        result.lines.len(),
+                        result.pattern,
+                        result.document_title
+                    ));
+
+                    // Action buttons
+                    let buttons = widget::row::with_children(vec![
+                        widget::button::standard(fl!("copy-to-new-file"))
+                            .on_press(Message::CopyMatchesToNewFile)
+                            .into(),
+                        widget::button::standard(fl!("copy-to-clipboard"))
+                            .on_press(Message::CopyMatchesToClipboard)
+                            .into(),
+                        widget::horizontal_space().into(),
+                        widget::button::text(fl!("cancel"))
+                            .on_press(Message::CloseDocumentSearchWindow)
+                            .into(),
+                    ])
+                    .spacing(spacing.space_xs);
+
+                    // Build clickable lines
+                    let mut lines_column = widget::column::with_capacity(result.lines.len());
+
+                    for (i, line_match) in result.lines.iter().enumerate() {
+                        lines_column = lines_column.push(
+                            widget::button::custom(
+                                widget::text(format!(
+                                    "{:>width$}: {}",
+                                    line_match.number,
+                                    line_match.text,
+                                    width = line_number_width
+                                ))
+                                .font(Font::MONOSPACE)
+                            )
+                            .on_press(Message::OpenDocumentSearchResult(i))
+                            .width(Length::Shrink)
+                            .padding([2, 8])
+                            .class(theme::Button::MenuRoot)
+                        );
+                    }
+
+                    // Main content
+                    widget::column::with_children(vec![
+                        title.into(),
+                        buttons.into(),
+                        widget::divider::horizontal::default().into(),
+                        widget::scrollable(
+                            widget::container(lines_column)
+                                .padding(spacing.space_xs)
+                        )
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into(),
+                    ])
+                    .spacing(spacing.space_s)
+                    .padding(spacing.space_m)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+                }
+                None => widget::text::body(fl!("no-matches")).into(),
+            };
+
+            // Wrap in container with proper background to prevent artifacts
+            return widget::container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .class(theme::Container::Background)
+                .into();
+        }
+
         match &self.dialog_opt {
             Some(dialog) => dialog.view(window_id),
             None => widget::text("Unknown window ID").into(),

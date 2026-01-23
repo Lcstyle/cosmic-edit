@@ -948,21 +948,38 @@ impl EditorTab {
 
     /// Search for all matches in the document and return them as a list.
     pub fn search_all_matches(&self, regex: &Regex) -> Vec<DocumentLineMatch> {
-        let editor = self.editor.lock().unwrap();
         let mut results = Vec::new();
 
-        editor.with_buffer(|buffer| {
-            for (line_idx, line) in buffer.lines.iter().enumerate() {
-                let text = line.text();
-                if let Some(m) = regex.find(text) {
-                    results.push(DocumentLineMatch {
-                        number: line_idx + 1,
-                        text: text.trim_end().to_string(),
-                        match_start: m.start(),
-                    });
+        // For large files with RopeBuffer, search the rope directly
+        if let Some(rope) = &self.rope_buffer {
+            let total_lines = rope.line_count();
+            for line_idx in 0..total_lines {
+                if let Some(text) = rope.line_text(line_idx) {
+                    if let Some(m) = regex.find(&text) {
+                        results.push(DocumentLineMatch {
+                            number: line_idx + 1,
+                            text: text.trim_end().to_string(),
+                            match_start: m.start(),
+                        });
+                    }
                 }
             }
-        });
+        } else {
+            // For regular files, search the editor buffer
+            let editor = self.editor.lock().unwrap();
+            editor.with_buffer(|buffer| {
+                for (line_idx, line) in buffer.lines.iter().enumerate() {
+                    let text = line.text();
+                    if let Some(m) = regex.find(text) {
+                        results.push(DocumentLineMatch {
+                            number: line_idx + 1,
+                            text: text.trim_end().to_string(),
+                            match_start: m.start(),
+                        });
+                    }
+                }
+            });
+        }
 
         results
     }

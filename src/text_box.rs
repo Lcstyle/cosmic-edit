@@ -1424,6 +1424,11 @@ where
                             .max(0.0);
                         buffer.set_scroll(scroll);
                     });
+                    // Trigger on_scroll callback for large file buffer refresh
+                    // Pass None to indicate incremental scroll (not jump to specific line)
+                    if let Some(on_scroll) = &self.on_scroll {
+                        shell.publish((on_scroll)(None));
+                    }
                     status = Status::Captured;
                 }
             }

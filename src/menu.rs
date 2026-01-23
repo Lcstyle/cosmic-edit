@@ -59,6 +59,8 @@ pub fn context_menu<'a>(
         menu_item(fl!("copy"), Action::Copy),
         menu_item(fl!("paste"), Action::Paste),
         menu_item(fl!("select-all"), Action::SelectAll),
+        divider::horizontal::light(),
+        menu_item(fl!("list-matches"), Action::ListMatchesSelection),
     ))
     .padding(1)
     //TODO: move style to libcosmic
