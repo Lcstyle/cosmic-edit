@@ -3235,11 +3235,9 @@ impl Application for App {
                 self.dialog_page_opt = Some(DialogPage::PromptSaveClose(entity));
             }
             Message::Quit => {
-                log::info!("hotexit: Message::Quit received");
-                // Create empty dialog
-                self.dialog_page_opt = Some(DialogPage::PromptSaveQuit(Vec::new()));
-                // This update will get the actual list of unsaved tabs
-                return self.update_dialogs();
+                log::info!("hotexit: Message::Quit received - silent close with backup");
+                // Skip dialog, go directly to QuitForce which preserves backups
+                return self.update(Message::QuitForce);
             }
             Message::QuitForce => {
                 // Save backups first (sets backup_id), then session (stores backup_id)
@@ -3603,6 +3601,14 @@ impl Application for App {
                 }
             }
             Message::TabCloseForce(entity) => {
+                // Delete backup for this tab since user explicitly discarded
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    if let Some(backup_id) = tab.backup_id.take() {
+                        hotexit::cleanup_backup_after_save(Some(backup_id));
+                        log::info!("hotexit: deleted backup for discarded tab");
+                    }
+                }
+
                 // Activate closest item
                 if let Some(position) = self.tab_model.position(entity) {
                     if position > 0 {
