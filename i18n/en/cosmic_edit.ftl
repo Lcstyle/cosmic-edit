@@ -86,6 +86,11 @@ replace-all = Replace all
 case-sensitive = Case sensitive
 use-regex = Use regex
 wrap-around = Wrap around
+list-matches = List matches
+matching-lines = Matching Lines
+no-matches = No matches found
+copy-to-new-file = Copy to New File
+copy-to-clipboard = Copy to Clipboard
 
 # Menu
 

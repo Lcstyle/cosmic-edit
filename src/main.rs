@@ -65,7 +65,7 @@ mod menu;
 use self::project::ProjectNode;
 mod project;
 
-use self::search::ProjectSearchResult;
+use self::search::{DocumentSearchResult, ProjectSearchResult};
 mod search;
 
 use self::tab::{EditorTab, GitDiffTab, Tab};
@@ -364,6 +364,10 @@ pub enum Message {
     FindSearchValueChanged(String),
     FindUseRegex(bool),
     FindWrapAround(bool),
+    FindListMatches(bool),
+    OpenDocumentSearchResult(usize),
+    CopyMatchesToNewFile,
+    CopyMatchesToClipboard,
     Focus(window::Id),
     GitProjectStatus(Vec<(String, PathBuf, Vec<GitStatus>)>),
     GitStage(PathBuf, PathBuf),
@@ -439,6 +443,7 @@ pub enum Message {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContextPage {
     About,
+    DocumentMatches,
     DocumentStatistics,
     GitManagement,
     //TODO: Move search to pop-up
@@ -495,6 +500,7 @@ pub struct App {
     project_search_id: widget::Id,
     project_search_value: String,
     project_search_result: Option<ProjectSearchResult>,
+    document_search_result: Option<DocumentSearchResult>,
     watcher_opt: Option<(
         notify::RecommendedWatcher,
         HashSet<(PathBuf, RecursiveMode)>,
@@ -1815,6 +1821,71 @@ impl App {
             .into()
     }
 
+    fn document_matches(&self) -> Element<'_, Message> {
+        let spacing = self.core().system_theme().cosmic().spacing;
+
+        let items = match &self.document_search_result {
+            Some(result) if !result.lines.is_empty() => {
+                let mut items = Vec::with_capacity(result.lines.len() + 3);
+
+                // Header with match count
+                items.push(
+                    widget::text::body(format!(
+                        "{} matches in {}",
+                        result.lines.len(),
+                        result.document_title
+                    )).into()
+                );
+
+                // Action buttons row
+                items.push(
+                    widget::row::with_children(vec![
+                        widget::button::standard(fl!("copy-to-new-file"))
+                            .on_press(Message::CopyMatchesToNewFile)
+                            .into(),
+                        widget::button::standard(fl!("copy-to-clipboard"))
+                            .on_press(Message::CopyMatchesToClipboard)
+                            .into(),
+                    ])
+                    .spacing(spacing.space_xs)
+                    .into()
+                );
+
+                // Results list
+                let line_number_width = result.lines.last()
+                    .map(|l| l.number.to_string().len())
+                    .unwrap_or(1);
+
+                for (i, line_match) in result.lines.iter().enumerate() {
+                    items.push(
+                        widget::button::custom(
+                            widget::row::with_children(vec![
+                                widget::text(format!("{:>width$}", line_match.number, width = line_number_width))
+                                    .font(Font::MONOSPACE)
+                                    .into(),
+                                widget::text(&line_match.text)
+                                    .font(Font::MONOSPACE)
+                                    .into(),
+                            ])
+                            .spacing(spacing.space_xs),
+                        )
+                        .on_press(Message::OpenDocumentSearchResult(i))
+                        .width(Length::Fill)
+                        .class(theme::Button::AppletMenu)
+                        .into(),
+                    );
+                }
+                items
+            }
+            _ => vec![widget::text::body(fl!("no-matches")).into()],
+        };
+
+        widget::column::with_children(items)
+            .spacing(spacing.space_s)
+            .padding([spacing.space_xxs, spacing.space_none])
+            .into()
+    }
+
     fn settings(&self) -> Element<'_, Message> {
         let app_theme_selected = match self.config.app_theme {
             AppTheme::Dark => 1,
@@ -2044,6 +2115,7 @@ impl Application for App {
             project_search_id: widget::Id::unique(),
             project_search_value: String::new(),
             project_search_result: None,
+            document_search_result: None,
             watcher_opt: None,
             modifiers: Modifiers::empty(),
             session_id: hotexit::generate_session_id(),
@@ -2628,7 +2700,19 @@ impl Application for App {
                         //TODO: do not compile find regex on every search?
                         match self.config.find_regex(&self.find_search_value) {
                             Ok(regex) => {
-                                tab.search(&regex, true, self.config.find_wrap_around);
+                                if self.config.find_list_matches {
+                                    // List all matching lines
+                                    let matches = tab.search_all_matches(&regex);
+                                    self.document_search_result = Some(DocumentSearchResult {
+                                        pattern: self.find_search_value.clone(),
+                                        document_title: tab.title(),
+                                        lines: matches,
+                                    });
+                                    self.context_page = ContextPage::DocumentMatches;
+                                    self.core.window.show_context = true;
+                                } else {
+                                    tab.search(&regex, true, self.config.find_wrap_around);
+                                }
                             }
                             Err(err) => {
                                 //TODO: put regex error in find box
@@ -2739,6 +2823,63 @@ impl Application for App {
             Message::FindWrapAround(find_wrap_around) => {
                 config_set!(find_wrap_around, find_wrap_around);
                 return self.update_config();
+            }
+            Message::FindListMatches(find_list_matches) => {
+                config_set!(find_list_matches, find_list_matches);
+                return self.update_config();
+            }
+            Message::OpenDocumentSearchResult(line_i) => {
+                if let Some(result) = &self.document_search_result {
+                    if let Some(line_match) = result.lines.get(line_i) {
+                        let entity = self.tab_model.active();
+                        let cursor = Cursor::new(
+                            line_match.number.saturating_sub(1),
+                            line_match.match_start,
+                        );
+                        return Task::batch([
+                            Task::perform(
+                                async move { action::app(Message::TabSetCursor(entity, cursor)) },
+                                |x| x,
+                            ),
+                            self.update_tab(),
+                        ]);
+                    }
+                }
+            }
+            Message::CopyMatchesToNewFile => {
+                if let Some(result) = &self.document_search_result {
+                    // Format results with line numbers
+                    let line_number_width = result.lines.last()
+                        .map(|l| l.number.to_string().len())
+                        .unwrap_or(1);
+
+                    let content: String = result.lines.iter()
+                        .map(|m| format!("{:>width$}: {}", m.number, m.text, width = line_number_width))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    // Open new tab with the content
+                    if let Some(entity) = self.open_tab(None) {
+                        if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                            tab.load_text(&content);
+                        }
+                        return self.update_tab();
+                    }
+                }
+            }
+            Message::CopyMatchesToClipboard => {
+                if let Some(result) = &self.document_search_result {
+                    let line_number_width = result.lines.last()
+                        .map(|l| l.number.to_string().len())
+                        .unwrap_or(1);
+
+                    let content: String = result.lines.iter()
+                        .map(|m| format!("{:>width$}: {}", m.number, m.text, width = line_number_width))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    return clipboard::write(content);
+                }
             }
             Message::FindFocused(has_focus) => {
                 if let Some(f) = self.find_opt.as_mut() {
@@ -3829,6 +3970,11 @@ impl Application for App {
                 |s| Message::LaunchUrl(s.to_string()),
                 Message::ToggleContextPage(ContextPage::About),
             ),
+            ContextPage::DocumentMatches => context_drawer::context_drawer(
+                self.document_matches(),
+                Message::ToggleContextPage(ContextPage::DocumentMatches),
+            )
+            .title(fl!("matching-lines")),
             ContextPage::DocumentStatistics => context_drawer::context_drawer(
                 self.document_statistics(),
                 Message::ToggleContextPage(ContextPage::DocumentStatistics),
@@ -4124,6 +4270,9 @@ impl Application for App {
                         .into(),
                     widget::checkbox(fl!("wrap-around"), self.config.find_wrap_around)
                         .on_toggle(Message::FindWrapAround)
+                        .into(),
+                    widget::checkbox(fl!("list-matches"), self.config.find_list_matches)
+                        .on_toggle(Message::FindListMatches)
                         .into(),
                 ])
                 .align_y(Alignment::Center)

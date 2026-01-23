@@ -26,6 +26,22 @@ pub struct ProjectSearchResult {
     pub files: Vec<FileSearchResult>,
 }
 
+/// Result for a single matching line within a document
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentLineMatch {
+    pub number: usize,           // 1-indexed line number
+    pub text: String,            // Line content
+    pub match_start: usize,      // Character index of first match
+}
+
+/// Results from searching the current document
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentSearchResult {
+    pub pattern: String,
+    pub document_title: String,
+    pub lines: Vec<DocumentLineMatch>,
+}
+
 impl ProjectSearchResult {
     pub fn search_projects(&mut self, projects: Vec<(String, PathBuf)>) {
         //TODO: support literal search

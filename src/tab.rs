@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{Config, SYNTAX_SYSTEM, backup, fl, git::GitDiff};
+use crate::{Config, SYNTAX_SYSTEM, backup, fl, git::GitDiff, search::DocumentLineMatch};
 
 /// Errors that can occur when saving a tab to disk.
 #[derive(Debug)]
@@ -944,6 +944,27 @@ impl EditorTab {
             }
         }
         false
+    }
+
+    /// Search for all matches in the document and return them as a list.
+    pub fn search_all_matches(&self, regex: &Regex) -> Vec<DocumentLineMatch> {
+        let editor = self.editor.lock().unwrap();
+        let mut results = Vec::new();
+
+        editor.with_buffer(|buffer| {
+            for (line_idx, line) in buffer.lines.iter().enumerate() {
+                let text = line.text();
+                if let Some(m) = regex.find(text) {
+                    results.push(DocumentLineMatch {
+                        number: line_idx + 1,
+                        text: text.trim_end().to_string(),
+                        match_start: m.start(),
+                    });
+                }
+            }
+        });
+
+        results
     }
 }
 
