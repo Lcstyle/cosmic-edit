@@ -22,6 +22,16 @@ pub enum AppTheme {
     System,
 }
 
+/// How to restore multiple sessions at startup
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SessionRestoreMode {
+    /// Open each session in a separate window (default behavior)
+    #[default]
+    SeparateWindows,
+    /// Merge all sessions into a single window
+    SingleWindow,
+}
+
 impl AppTheme {
     pub fn theme(&self) -> theme::Theme {
         match self {
@@ -46,6 +56,9 @@ pub struct Config {
     /// Reopen projects and tabs from previous session on start
     #[serde(default = "default_true")]
     pub reopen_on_start: bool,
+    /// How to restore multiple sessions (single window or separate windows)
+    #[serde(default)]
+    pub session_restore_mode: SessionRestoreMode,
     /// Auto-save files after a period of inactivity (off by default)
     #[serde(default)]
     pub auto_save: bool,
@@ -103,6 +116,7 @@ impl Default for Config {
         Self {
             app_theme: AppTheme::System,
             reopen_on_start: true,
+            session_restore_mode: SessionRestoreMode::default(),
             auto_save: false,
             auto_save_interval_secs: 2,
             auto_indent: true,

@@ -714,6 +714,8 @@ impl RestoreDialogState {
 // Startup action helpers
 // ============================================================================
 
+use crate::config::SessionRestoreMode;
+
 /// Action to take at startup based on orphaned sessions
 pub enum StartupAction {
     /// No orphaned sessions found, normal startup
@@ -726,6 +728,8 @@ pub enum StartupAction {
         first_session: (u64, SessionState),
         spawn_sessions: Vec<u64>,
     },
+    /// Restore all sessions in a single window (SingleWindow mode)
+    RestoreAllInSingle(Vec<(u64, SessionState)>),
     /// Too many orphaned sessions, prompt user for action
     /// Contains all orphaned session IDs
     PromptUser(Vec<u64>),
@@ -735,13 +739,26 @@ pub enum StartupAction {
 ///
 /// This encapsulates the logic for deciding what to do at startup when there are
 /// orphaned sessions from previous crashes.
-pub fn determine_startup_action(reopen_on_start: bool, max_auto_restore: usize) -> StartupAction {
+pub fn determine_startup_action(
+    reopen_on_start: bool,
+    max_auto_restore: usize,
+    restore_mode: SessionRestoreMode,
+) -> StartupAction {
     if !reopen_on_start {
         debug!("hotexit: reopen_on_start disabled, skipping session restore");
         return StartupAction::Normal;
     }
 
     let orphaned = find_all_orphaned_sessions();
+
+    // SingleWindow mode: always restore all sessions silently (no prompt)
+    if restore_mode == SessionRestoreMode::SingleWindow && !orphaned.is_empty() {
+        info!(
+            "hotexit: restoring {} sessions in single window (SingleWindow mode)",
+            orphaned.len()
+        );
+        return StartupAction::RestoreAllInSingle(orphaned);
+    }
 
     match orphaned.len() {
         0 => {
