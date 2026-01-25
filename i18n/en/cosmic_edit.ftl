@@ -175,3 +175,5 @@ view-mode = View Mode
 view-raw = Raw
 view-rendered = Rendered
 view-split = Split
+default-markdown-view = Default markdown view
+default-markdown-view-description = How markdown files open by default

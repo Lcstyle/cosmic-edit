@@ -32,6 +32,18 @@ pub enum SessionRestoreMode {
     SingleWindow,
 }
 
+/// Default view mode for markdown files
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DefaultMarkdownViewMode {
+    /// Raw text editing view
+    Raw,
+    /// Rendered markdown view (read-only)
+    #[default]
+    Rendered,
+    /// Split view with editor and rendered side-by-side
+    Split,
+}
+
 impl AppTheme {
     pub fn theme(&self) -> theme::Theme {
         match self {
@@ -100,6 +112,10 @@ pub struct Config {
     /// Default: 1MB (1048576 bytes).
     #[serde(default = "default_ai_max_content_size")]
     pub ai_max_content_size: usize,
+    /// Default view mode for markdown files (Raw, Rendered, or Split).
+    /// Default: Rendered.
+    #[serde(default)]
+    pub default_markdown_view_mode: DefaultMarkdownViewMode,
 }
 
 fn default_ai_max_content_size() -> usize {
@@ -152,6 +168,7 @@ impl Default for Config {
             pinned_notes_dir: default_pinned_notes_dir(),
             anthropic_api_key: None,
             ai_max_content_size: default_ai_max_content_size(),
+            default_markdown_view_mode: DefaultMarkdownViewMode::default(),
         }
     }
 }

@@ -47,6 +47,10 @@ struct RenderState {
     heading_level: Option<HeadingLevel>,
     /// Accumulated text for current heading
     heading_text: String,
+    /// Whether we're inside strong/bold text
+    in_strong: bool,
+    /// Whether we're inside emphasized/italic text
+    in_emphasis: bool,
 }
 
 impl Default for RenderState {
@@ -60,6 +64,8 @@ impl Default for RenderState {
             in_paragraph: false,
             heading_level: None,
             heading_text: String::new(),
+            in_strong: false,
+            in_emphasis: false,
         }
     }
 }
@@ -93,8 +99,14 @@ fn render_events<'a>(parser: Parser<'_>) -> Vec<Element<'a, Message>> {
                 Tag::BlockQuote => {
                     // Start blockquote
                 }
-                Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } => {
-                    // Inline formatting - we'll handle in text
+                Tag::Strong => {
+                    state.in_strong = true;
+                }
+                Tag::Emphasis => {
+                    state.in_emphasis = true;
+                }
+                Tag::Strikethrough | Tag::Link { .. } => {
+                    // Other inline formatting - handled in text
                 }
                 _ => {}
             },
@@ -124,6 +136,12 @@ fn render_events<'a>(parser: Parser<'_>) -> Vec<Element<'a, Message>> {
                 TagEnd::Item => {
                     // Item end - handled when text is added
                 }
+                TagEnd::Strong => {
+                    state.in_strong = false;
+                }
+                TagEnd::Emphasis => {
+                    state.in_emphasis = false;
+                }
                 _ => {}
             },
             Event::Text(text) => {
@@ -132,7 +150,18 @@ fn render_events<'a>(parser: Parser<'_>) -> Vec<Element<'a, Message>> {
                 } else if state.heading_level.is_some() {
                     state.heading_text.push_str(&text);
                 } else if state.in_paragraph {
-                    state.paragraph_text.push_str(&text);
+                    // For paragraph text, mark bold/emphasis with markers
+                    if state.in_strong {
+                        state.paragraph_text.push_str("\x02"); // Start bold marker
+                        state.paragraph_text.push_str(&text);
+                        state.paragraph_text.push_str("\x03"); // End bold marker
+                    } else if state.in_emphasis {
+                        state.paragraph_text.push_str("\x04"); // Start italic marker
+                        state.paragraph_text.push_str(&text);
+                        state.paragraph_text.push_str("\x05"); // End italic marker
+                    } else {
+                        state.paragraph_text.push_str(&text);
+                    }
                 } else if state.list_depth > 0 {
                     // List item text
                     let indent = "    ".repeat(state.list_depth.saturating_sub(1));
@@ -143,10 +172,10 @@ fn render_events<'a>(parser: Parser<'_>) -> Vec<Element<'a, Message>> {
                     } else {
                         "\u{2022} ".to_string() // bullet point
                     };
-                    elements.push(render_list_item(&indent, &bullet, &text));
+                    elements.push(render_list_item(&indent, &bullet, &text, state.in_strong, state.in_emphasis));
                 } else {
-                    // Standalone text
-                    elements.push(render_paragraph(&text));
+                    // Standalone text - render with formatting
+                    elements.push(render_text_with_formatting(&text, state.in_strong, state.in_emphasis));
                 }
             }
             Event::Code(code) => {
@@ -201,10 +230,124 @@ fn render_heading<'a>(level: HeadingLevel, text: &str) -> Element<'a, Message> {
 }
 
 fn render_paragraph<'a>(text: &str) -> Element<'a, Message> {
-    widget::text(text.to_string())
-        .width(Length::Fill)
-        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+    // Check for formatting markers and render appropriately
+    // \x02...\x03 = bold, \x04...\x05 = italic
+    if text.contains('\x02') || text.contains('\x04') {
+        // Has formatting - render as rich text
+        render_rich_paragraph(text)
+    } else {
+        widget::text(text.to_string())
+            .width(Length::Fill)
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .into()
+    }
+}
+
+fn render_rich_paragraph<'a>(text: &str) -> Element<'a, Message> {
+    // Parse formatted text and render as a row of text widgets
+    let mut parts: Vec<Element<'a, Message>> = Vec::new();
+    let mut current = String::new();
+    let mut in_bold = false;
+    let mut in_italic = false;
+
+    for c in text.chars() {
+        match c {
+            '\x02' => {
+                // Start bold
+                if !current.is_empty() {
+                    parts.push(widget::text(std::mem::take(&mut current)).into());
+                }
+                in_bold = true;
+            }
+            '\x03' => {
+                // End bold
+                if !current.is_empty() {
+                    parts.push(
+                        widget::text(std::mem::take(&mut current))
+                            .font(cosmic::font::Font {
+                                weight: cosmic::iced::font::Weight::Bold,
+                                ..cosmic::font::default()
+                            })
+                            .into(),
+                    );
+                }
+                in_bold = false;
+            }
+            '\x04' => {
+                // Start italic
+                if !current.is_empty() {
+                    parts.push(widget::text(std::mem::take(&mut current)).into());
+                }
+                in_italic = true;
+            }
+            '\x05' => {
+                // End italic
+                if !current.is_empty() {
+                    parts.push(
+                        widget::text(std::mem::take(&mut current))
+                            .font(cosmic::font::Font {
+                                style: cosmic::iced::font::Style::Italic,
+                                ..cosmic::font::default()
+                            })
+                            .into(),
+                    );
+                }
+                in_italic = false;
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Remaining text
+    if !current.is_empty() {
+        if in_bold {
+            parts.push(
+                widget::text(current)
+                    .font(cosmic::font::Font {
+                        weight: cosmic::iced::font::Weight::Bold,
+                        ..cosmic::font::default()
+                    })
+                    .into(),
+            );
+        } else if in_italic {
+            parts.push(
+                widget::text(current)
+                    .font(cosmic::font::Font {
+                        style: cosmic::iced::font::Style::Italic,
+                        ..cosmic::font::default()
+                    })
+                    .into(),
+            );
+        } else {
+            parts.push(widget::text(current).into());
+        }
+    }
+
+    widget::row::with_children(parts)
+        .wrap()
         .into()
+}
+
+fn render_text_with_formatting<'a>(text: &str, bold: bool, italic: bool) -> Element<'a, Message> {
+    let mut txt = widget::text(text.to_string())
+        .width(Length::Fill)
+        .wrapping(cosmic::iced::widget::text::Wrapping::Word);
+
+    if bold {
+        txt = txt.font(cosmic::font::Font {
+            weight: cosmic::iced::font::Weight::Bold,
+            ..cosmic::font::default()
+        });
+    } else if italic {
+        txt = txt.font(cosmic::font::Font {
+            style: cosmic::iced::font::Style::Italic,
+            ..cosmic::font::default()
+        });
+    }
+
+    txt.into()
 }
 
 fn render_code_block<'a>(code: &str) -> Element<'a, Message> {
@@ -255,15 +398,27 @@ fn render_inline_code<'a>(code: &str) -> Element<'a, Message> {
     .into()
 }
 
-fn render_list_item<'a>(indent: &str, bullet: &str, text: &str) -> Element<'a, Message> {
+fn render_list_item<'a>(indent: &str, bullet: &str, text: &str, bold: bool, italic: bool) -> Element<'a, Message> {
+    let mut txt = widget::text(text.to_string())
+        .width(Length::Fill)
+        .wrapping(cosmic::iced::widget::text::Wrapping::Word);
+
+    if bold {
+        txt = txt.font(cosmic::font::Font {
+            weight: cosmic::iced::font::Weight::Bold,
+            ..cosmic::font::default()
+        });
+    } else if italic {
+        txt = txt.font(cosmic::font::Font {
+            style: cosmic::iced::font::Style::Italic,
+            ..cosmic::font::default()
+        });
+    }
+
     widget::row::with_capacity(2)
         .align_y(Alignment::Start)
         .push(widget::text(format!("{}{}", indent, bullet)))
-        .push(
-            widget::text(text.to_string())
-                .width(Length::Fill)
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word),
-        )
+        .push(txt)
         .spacing(4)
         .into()
 }

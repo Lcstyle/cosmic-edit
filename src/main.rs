@@ -466,6 +466,7 @@ pub enum Message {
     PinNameCancelled,
     AiSuggestionReceived(String),
     AnthropicApiKeyChanged(String),
+    DefaultMarkdownViewMode(usize),
     TabPin(segmented_button::Entity),
     TabUnpin(segmented_button::Entity),
     // Pinned notes sidebar messages
@@ -520,6 +521,7 @@ pub struct App {
     key_binds: HashMap<KeyBind, Action>,
     app_themes: Vec<String>,
     session_restore_modes: Vec<String>,
+    markdown_view_modes: Vec<String>,
     font_names: Vec<String>,
     font_size_names: Vec<String>,
     font_sizes: Vec<u16>,
@@ -984,6 +986,9 @@ impl App {
                 hotexit::RestoredTab::FromFile { path, is_pinned } => {
                     let mut tab = EditorTab::new(&self.config);
                     tab.open(path);
+                    if tab.is_markdown() {
+                        tab.markdown_view_mode = self.config.default_markdown_view_mode.into();
+                    }
                     tab.is_pinned = is_pinned;
                     let mut title = tab.title();
                     if is_pinned {
@@ -1314,6 +1319,9 @@ impl App {
 
                 let mut tab = EditorTab::new(&self.config);
                 tab.open(canonical);
+                if tab.is_markdown() {
+                    tab.markdown_view_mode = self.config.default_markdown_view_mode.into();
+                }
                 Some(NewTab::Tab(tab))
             }
             None => Some(NewTab::Tab(EditorTab::new(&self.config))),
@@ -1960,6 +1968,19 @@ impl App {
                         .description(fl!("auto-save-description"))
                         .toggler(self.config.auto_save, Message::AutoSaveToggle),
                 )
+                .add(
+                    widget::settings::item::builder(fl!("default-markdown-view"))
+                        .description(fl!("default-markdown-view-description"))
+                        .control(widget::dropdown(
+                            &self.markdown_view_modes,
+                            Some(match self.config.default_markdown_view_mode {
+                                config::DefaultMarkdownViewMode::Raw => 0,
+                                config::DefaultMarkdownViewMode::Rendered => 1,
+                                config::DefaultMarkdownViewMode::Split => 2,
+                            }),
+                            Message::DefaultMarkdownViewMode,
+                        )),
+                )
                 .into(),
             widget::settings::section()
                 .title(fl!("ai-features"))
@@ -2084,6 +2105,11 @@ impl Application for App {
             fl!("session-restore-separate"),
             fl!("session-restore-single"),
         ];
+        let markdown_view_modes = vec![
+            fl!("view-raw"),
+            fl!("view-rendered"),
+            fl!("view-split"),
+        ];
 
         let font_names = {
             let mut font_names = Vec::new();
@@ -2154,6 +2180,7 @@ impl Application for App {
             zoom_steps,
             app_themes,
             session_restore_modes,
+            markdown_view_modes,
             font_names,
             font_size_names,
             font_sizes,
@@ -4248,6 +4275,14 @@ impl Application for App {
             Message::SessionRestoreMode(mode) => {
                 config_set!(session_restore_mode, mode);
             }
+            Message::DefaultMarkdownViewMode(index) => {
+                let mode = match index {
+                    0 => config::DefaultMarkdownViewMode::Raw,
+                    2 => config::DefaultMarkdownViewMode::Split,
+                    _ => config::DefaultMarkdownViewMode::Rendered,
+                };
+                config_set!(default_markdown_view_mode, mode);
+            }
             Message::AnthropicApiKeyChanged(key) => {
                 let key_opt = if key.trim().is_empty() {
                     None
@@ -4428,6 +4463,9 @@ impl Application for App {
                     // Open new tab, mark as pinned
                     let mut tab = EditorTab::new(&self.config);
                     tab.open(path);
+                    if tab.is_markdown() {
+                        tab.markdown_view_mode = self.config.default_markdown_view_mode.into();
+                    }
                     tab.is_pinned = true;
                     let title = format!("\u{1F4CC} {}", tab.title());
 

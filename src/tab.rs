@@ -104,6 +104,16 @@ impl MarkdownViewMode {
     }
 }
 
+impl From<crate::config::DefaultMarkdownViewMode> for MarkdownViewMode {
+    fn from(mode: crate::config::DefaultMarkdownViewMode) -> Self {
+        match mode {
+            crate::config::DefaultMarkdownViewMode::Raw => Self::Raw,
+            crate::config::DefaultMarkdownViewMode::Rendered => Self::Rendered,
+            crate::config::DefaultMarkdownViewMode::Split => Self::Split,
+        }
+    }
+}
+
 /// File size threshold (in bytes) above which we set a minimal buffer height
 /// before loading to prevent shaping all lines at once.
 /// This prevents the 313x memory multiplier crash on large files.
