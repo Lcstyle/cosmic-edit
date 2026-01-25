@@ -146,3 +146,16 @@ syntax-highlighting = Syntax highlighting...
 menu-settings = Settings...
 menu-keyboard-shortcuts = Keyboard shortcuts...
 menu-about = About COSMIC Text Editor...
+
+# Pinned tabs
+pin-tab = Pin Tab
+unpin-tab = Unpin Tab
+pin-tab-title = Pin Tab
+pin-tab-body = Enter a name for this pinned note:
+pin-name-placeholder = Note name
+
+# Markdown view
+view-mode = View Mode
+view-raw = Raw
+view-rendered = Rendered
+view-split = Split

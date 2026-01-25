@@ -444,6 +444,16 @@ pub enum Message {
     UpdateGitProjectStatus,
     VimBindings(bool),
     ReopenOnStart(bool),
+    // Pinned tabs messages
+    PromptPinName(segmented_button::Entity),
+    PinNameValueChanged(String),
+    PinNameConfirmed(segmented_button::Entity, String),
+    PinNameCancelled,
+    TabPin(segmented_button::Entity),
+    TabUnpin(segmented_button::Entity),
+    // Markdown view mode messages
+    SetMarkdownViewMode(segmented_button::Entity, tab::MarkdownViewMode),
+    ToggleMarkdownViewMode(segmented_button::Entity),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,6 +474,8 @@ enum DialogPage {
     PromptSaveQuit(Vec<segmented_button::Entity>),
     /// Prompt user to select how to handle multiple orphaned sessions.
     PromptRestoreSessions(Vec<u64>, RestoreOption),
+    /// Prompt user to enter a name for a pinned tab.
+    PromptPinName(segmented_button::Entity),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,6 +527,10 @@ pub struct App {
     session_id: u64,
     /// Tabs with pending saves: maps entity -> scheduled save time
     pending_saves: HashMap<Entity, std::time::Instant>,
+    /// Current value in the pin name dialog text input
+    pin_name_value: String,
+    /// Widget ID for the pin name text input
+    pin_name_id: widget::Id,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1344,6 +1360,9 @@ impl App {
             Some(DialogPage::PromptRestoreSessions(_, _)) => {
                 // Session restore dialog doesn't need periodic updates
             }
+            Some(DialogPage::PromptPinName(_)) => {
+                // Pin name dialog doesn't need periodic updates
+            }
             None => {}
         }
         Task::none()
@@ -2073,6 +2092,8 @@ impl Application for App {
             modifiers: Modifiers::empty(),
             session_id: hotexit::generate_session_id(),
             pending_saves: HashMap::new(),
+            pin_name_value: String::new(),
+            pin_name_id: widget::Id::unique(),
         };
 
         // Do not show nav bar by default. Will be opened by open_project if needed
@@ -2434,6 +2455,29 @@ impl Application for App {
                     .icon(icon::from_name("dialog-question-symbolic").size(64))
                     .control(column)
                     .primary_action(confirm_button)
+                    .secondary_action(cancel_button);
+
+                Some(dialog.into())
+            }
+            DialogPage::PromptPinName(entity) => {
+                let entity = *entity;
+                let pin_button = widget::button::suggested(fl!("pin-tab"))
+                    .on_press(Message::PinNameConfirmed(entity, self.pin_name_value.clone()));
+                let cancel_button =
+                    widget::button::text(fl!("cancel")).on_press(Message::PinNameCancelled);
+
+                let pin_name = self.pin_name_value.clone();
+                let text_input = widget::text_input(fl!("pin-name-placeholder"), &self.pin_name_value)
+                    .id(self.pin_name_id.clone())
+                    .on_input(Message::PinNameValueChanged)
+                    .on_submit(move |_| Message::PinNameConfirmed(entity, pin_name.clone()));
+
+                let dialog = widget::dialog()
+                    .title(fl!("pin-tab-title"))
+                    .body(fl!("pin-tab-body"))
+                    .icon(icon::from_name("bookmark-new-symbolic").size(64))
+                    .control(text_input)
+                    .primary_action(pin_button)
                     .secondary_action(cancel_button);
 
                 Some(dialog.into())
@@ -3990,6 +4034,97 @@ impl Application for App {
                     if !self.core.window.show_context {
                         return self.update_focus();
                     }
+                }
+            }
+            // Pinned tabs messages
+            Message::PromptPinName(entity) => {
+                // Pre-fill with tab title or default name
+                let default_name = if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
+                    if let Some(path) = &tab.path_opt {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| fl!("new-document"))
+                    } else {
+                        fl!("new-document")
+                    }
+                } else {
+                    fl!("new-document")
+                };
+                self.pin_name_value = default_name;
+                self.dialog_page_opt = Some(DialogPage::PromptPinName(entity));
+                return widget::text_input::focus(self.pin_name_id.clone());
+            }
+            Message::PinNameValueChanged(value) => {
+                self.pin_name_value = value;
+            }
+            Message::PinNameConfirmed(entity, name) => {
+                self.dialog_page_opt = None;
+                if name.trim().is_empty() {
+                    return Task::none();
+                }
+
+                // Get the content from the tab
+                let content = if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
+                    tab.text()
+                } else {
+                    return Task::none();
+                };
+
+                // Pin the tab
+                match pinned::pin_tab(&self.config.pinned_notes_dir, &name, &content, false) {
+                    Ok(path) => {
+                        // Update the tab to point to the new file and mark as pinned
+                        // First, update the tab data
+                        let (title, icon) = if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                            tab.path_opt = Some(path);
+                            tab.is_pinned = true;
+                            let _ = tab.save();
+                            let title = format!("\u{1F4CC} {}", tab.title());
+                            let icon = tab.icon(16);
+                            (title, icon)
+                        } else {
+                            return Task::none();
+                        };
+                        // Then update the tab bar (outside the borrow)
+                        self.tab_model.text_set(entity, title);
+                        self.tab_model.icon_set(entity, icon);
+                        self.update_watcher();
+                        log::info!("Tab pinned successfully");
+                    }
+                    Err(pinned::PinError::FileAlreadyExists(path)) => {
+                        log::warn!("Pinned file already exists: {:?}", path);
+                        // TODO: Show error dialog or offer to overwrite
+                    }
+                    Err(e) => {
+                        log::error!("Failed to pin tab: {}", e);
+                    }
+                }
+            }
+            Message::PinNameCancelled => {
+                self.dialog_page_opt = None;
+                self.pin_name_value.clear();
+            }
+            Message::TabPin(entity) => {
+                return self.update(Message::PromptPinName(entity));
+            }
+            Message::TabUnpin(entity) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    tab.is_pinned = false;
+                    // Update the title to remove pin icon
+                    let title = tab.title();
+                    self.tab_model.text_set(entity, title);
+                }
+            }
+            // Markdown view mode messages
+            Message::SetMarkdownViewMode(entity, mode) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    tab.markdown_view_mode = mode;
+                }
+            }
+            Message::ToggleMarkdownViewMode(entity) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    tab.markdown_view_mode = tab.markdown_view_mode.next();
                 }
             }
         }
