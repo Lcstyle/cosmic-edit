@@ -70,6 +70,11 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
         Key::Character("M".into()),
         ToggleMarkdownViewMode
     );
+    bind!(
+        [Ctrl, Shift],
+        Key::Character("P".into()),
+        TogglePinnedSidebar
+    );
 
     key_binds
 }

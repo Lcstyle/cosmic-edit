@@ -238,6 +238,7 @@ pub enum Action {
     ToggleProjectSearch,
     ToggleSettingsPage,
     ListMatchesSelection,
+    TogglePinnedSidebar,
     ToggleWordWrap,
     ToggleMarkdownViewMode,
     Undo,
@@ -292,6 +293,7 @@ impl Action {
             Self::ToggleProjectSearch => Message::ToggleContextPage(ContextPage::ProjectSearch),
             Self::ToggleSettingsPage => Message::ToggleContextPage(ContextPage::Settings),
             Self::ListMatchesSelection => Message::ListMatchesSelection,
+            Self::TogglePinnedSidebar => Message::TogglePinnedNotesSidebar,
             Self::ToggleWordWrap => Message::ToggleWordWrap,
             Self::ToggleMarkdownViewMode => {
                 if let Some(entity) = entity_opt {
@@ -440,6 +442,7 @@ pub enum Message {
     TabCloseForce(segmented_button::Entity),
     TabContextAction(segmented_button::Entity, Action),
     TabContextMenu(segmented_button::Entity, Option<Point>),
+    TabBarContextMenu(segmented_button::Entity, Option<Point>),
     TabNext,
     TabPrev,
     TabSetCursor(segmented_button::Entity, Cursor),
@@ -454,6 +457,7 @@ pub enum Message {
     UpdateGitProjectStatus,
     VimBindings(bool),
     ReopenOnStart(bool),
+    SessionRestoreMode(config::SessionRestoreMode),
     // Pinned tabs messages
     PromptPinName(segmented_button::Entity),
     PinNameValueChanged(String),
@@ -461,6 +465,10 @@ pub enum Message {
     PinNameCancelled,
     TabPin(segmented_button::Entity),
     TabUnpin(segmented_button::Entity),
+    // Pinned notes sidebar messages
+    TogglePinnedNotesSidebar,
+    RefreshPinnedNotes,
+    OpenPinnedNote(PathBuf),
     // Markdown view mode messages
     SetMarkdownViewMode(segmented_button::Entity, tab::MarkdownViewMode),
     ToggleMarkdownViewMode(segmented_button::Entity),
@@ -508,6 +516,7 @@ pub struct App {
     zoom_steps: Vec<u16>,
     key_binds: HashMap<KeyBind, Action>,
     app_themes: Vec<String>,
+    session_restore_modes: Vec<String>,
     font_names: Vec<String>,
     font_size_names: Vec<String>,
     font_sizes: Vec<u16>,
@@ -541,6 +550,12 @@ pub struct App {
     pin_name_value: String,
     /// Widget ID for the pin name text input
     pin_name_id: widget::Id,
+    /// Whether the pinned notes sidebar is visible
+    show_pinned_sidebar: bool,
+    /// Cached list of pinned notes from the directory
+    pinned_notes: Vec<pinned::PinnedNote>,
+    /// State for tab bar context menu (entity and position for popover)
+    tab_bar_context_menu: Option<(segmented_button::Entity, Point)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -806,7 +821,7 @@ impl App {
 
     /// Save current session state (open files and projects)
     fn save_session(&self) {
-        let (tabs, active_tab) = self.collect_session_tabs();
+        let (mut tabs, mut active_tab) = self.collect_session_tabs();
         let projects = self.collect_session_projects();
         let active_project_path = self.get_active_project_path();
 
@@ -815,6 +830,20 @@ impl App {
             log::debug!("hotexit: skipping session save - no meaningful content to restore");
             hotexit::release_and_cleanup_session(self.session_id);
             return;
+        }
+
+        // Safety limit: warn and truncate if we have too many tabs (indicates a bug)
+        const MAX_SAVE_TABS: usize = 500;
+        if tabs.len() > MAX_SAVE_TABS {
+            log::warn!(
+                "hotexit: session has {} tabs (limit: {}), truncating to prevent runaway growth",
+                tabs.len(),
+                MAX_SAVE_TABS
+            );
+            tabs.truncate(MAX_SAVE_TABS);
+            if active_tab >= tabs.len() {
+                active_tab = tabs.len().saturating_sub(1);
+            }
         }
 
         let state = hotexit::SessionState {
@@ -1904,6 +1933,22 @@ impl App {
                         .toggler(self.config.reopen_on_start, Message::ReopenOnStart),
                 )
                 .add(
+                    widget::settings::item::builder(fl!("session-restore-mode"))
+                        .control(widget::dropdown(
+                            &self.session_restore_modes,
+                            Some(match self.config.session_restore_mode {
+                                config::SessionRestoreMode::SeparateWindows => 0,
+                                config::SessionRestoreMode::SingleWindow => 1,
+                            }),
+                            |index| {
+                                Message::SessionRestoreMode(match index {
+                                    1 => config::SessionRestoreMode::SingleWindow,
+                                    _ => config::SessionRestoreMode::SeparateWindows,
+                                })
+                            },
+                        )),
+                )
+                .add(
                     widget::settings::item::builder(fl!("auto-save"))
                         .description(fl!("auto-save-description"))
                         .toggler(self.config.auto_save, Message::AutoSaveToggle),
@@ -1970,6 +2015,7 @@ impl App {
         ])
         .into()
     }
+
 }
 
 /// Implement [`cosmic::Application`] to integrate with COSMIC.
@@ -2008,6 +2054,10 @@ impl Application for App {
         }
 
         let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
+        let session_restore_modes = vec![
+            fl!("session-restore-separate"),
+            fl!("session-restore-single"),
+        ];
 
         let font_names = {
             let mut font_names = Vec::new();
@@ -2077,6 +2127,7 @@ impl Application for App {
             zoom_step_names,
             zoom_steps,
             app_themes,
+            session_restore_modes,
             font_names,
             font_size_names,
             font_sizes,
@@ -2104,6 +2155,9 @@ impl Application for App {
             pending_saves: HashMap::new(),
             pin_name_value: String::new(),
             pin_name_id: widget::Id::unique(),
+            show_pinned_sidebar: false,
+            pinned_notes: Vec::new(),
+            tab_bar_context_menu: None,
         };
 
         // Do not show nav bar by default. Will be opened by open_project if needed
@@ -2161,6 +2215,7 @@ impl Application for App {
             match hotexit::determine_startup_action(
                 app.config.reopen_on_start,
                 app.config.hot_exit_max_auto_restore,
+                app.config.session_restore_mode,
             ) {
                 hotexit::StartupAction::Normal => {}
                 hotexit::StartupAction::RestoreSingle(session_id, state) => {
@@ -2175,6 +2230,34 @@ impl Application for App {
                         hotexit::spawn_restore_instance(session_id);
                     }
                 }
+                hotexit::StartupAction::RestoreAllInSingle(sessions) => {
+                    // Restore all sessions in single window:
+                    // - Adopt the FIRST session (keep its session_id)
+                    // - Merge tabs from remaining sessions, then DISCARD them
+                    let mut sessions_iter = sessions.into_iter();
+
+                    // First session: adopt normally
+                    if let Some((session_id, state)) = sessions_iter.next() {
+                        if app.try_adopt_and_restore(session_id, state) {
+                            restored_session = true;
+                        }
+                    }
+
+                    // Remaining sessions: merge tabs only, then discard
+                    for (session_id, state) in sessions_iter {
+                        log::info!(
+                            "hotexit: merging session {:016x} into current window ({} tabs, {} projects)",
+                            session_id,
+                            state.tabs.len(),
+                            state.projects.len()
+                        );
+                        // Restore tabs without adopting session_id
+                        app.restore_session_state(app.session_id, state);
+                        // Discard the merged session so it doesn't load again
+                        hotexit::discard_session(session_id);
+                        restored_session = true;
+                    }
+                }
                 hotexit::StartupAction::PromptUser(session_ids) => {
                     // Default to RestoreFirstN (restore up to max_auto_restore sessions)
                     app.dialog_page_opt = Some(DialogPage::PromptRestoreSessions(
@@ -2187,53 +2270,9 @@ impl Application for App {
 
         app.update_nav_bar_placeholder();
 
-        // Load pinned tabs from the pinned notes directory
-        let pinned_notes = pinned::scan_pinned_notes(&app.config.pinned_notes_dir);
-        let had_pinned_notes = !pinned_notes.is_empty();
-        for note in pinned_notes {
-            // Check if this file is already open
-            let existing_entity = app.tab_model.iter().find(|entity| {
-                if let Some(Tab::Editor(tab)) = app.tab_model.data::<Tab>(*entity) {
-                    tab.path_opt.as_ref() == Some(&note.path)
-                } else {
-                    false
-                }
-            });
-
-            if let Some(entity) = existing_entity {
-                // Mark existing tab as pinned if it's in the pinned directory
-                let title = if let Some(Tab::Editor(tab)) = app.tab_model.data_mut::<Tab>(entity) {
-                    if !tab.is_pinned {
-                        tab.is_pinned = true;
-                        Some(format!("\u{1F4CC} {}", tab.title()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some(title) = title {
-                    app.tab_model.text_set(entity, title);
-                }
-            } else {
-                // Open new pinned tab
-                let mut tab = EditorTab::new(&app.config);
-                tab.open(note.path);
-                tab.is_pinned = true;
-                let title = format!("\u{1F4CC} {}", tab.title());
-                // Insert pinned tabs at the beginning of the tab bar
-                app.tab_model
-                    .insert()
-                    .position(0)
-                    .text(title)
-                    .icon(tab.icon(16))
-                    .data::<Tab>(Tab::Editor(tab))
-                    .closable();
-            }
-        }
-        if had_pinned_notes {
-            app.update_watcher();
-        }
+        // Scan pinned notes for sidebar (do NOT auto-open as tabs)
+        app.pinned_notes = pinned::scan_pinned_notes(&app.config.pinned_notes_dir);
+        app.show_pinned_sidebar = !app.pinned_notes.is_empty();
 
         // Open an empty file if no tabs were restored and no dialog is showing
         if app.tab_model.iter().next().is_none() && app.dialog_page_opt.is_none() {
@@ -2259,37 +2298,94 @@ impl Application for App {
             return None;
         }
 
-        let nav_model = self.nav_model()?;
-
         let cosmic_theme::Spacing {
             space_none,
             space_s,
+            space_xxs,
             space_xxxs,
             ..
         } = self.core().system_theme().cosmic().spacing;
 
-        let mut nav = segmented_button::vertical(nav_model)
-            .button_height(space_xxxs + 20 /* line height */ + space_xxxs)
-            .button_padding([space_s, space_xxxs, space_s, space_xxxs])
-            .button_spacing(space_xxxs)
-            .on_activate(|entity| action::cosmic(cosmic::app::Action::NavBar(entity)))
-            .spacing(space_none)
-            .style(theme::SegmentedButton::FileNav)
-            .apply(widget::container)
-            .padding(space_s)
-            .width(Length::Shrink);
+        // Build main content column
+        // Capacity: pinned header + notes + divider + project nav
+        let pinned_count = if self.show_pinned_sidebar { self.pinned_notes.len() + 2 } else { 0 };
+        let mut content = widget::column::with_capacity(pinned_count + 1)
+            .width(Length::Fill); // Fill within the fixed-width outer container
 
-        if !self.core().is_condensed() {
-            nav = nav.max_width(280);
+        // Add pinned notes sidebar if visible
+        if self.show_pinned_sidebar {
+            // Header: "Pinned Notes" with collapse button
+            let header = button::custom(
+                widget::row::with_capacity(3)
+                    .push(icon_cache_get("user-bookmarks-symbolic", 16))
+                    .push(widget::text(fl!("pinned-notes")).size(14))
+                    .push(icon_cache_get("pan-up-symbolic", 12))
+                    .align_y(Alignment::Center)
+                    .spacing(space_xxs),
+            )
+            .on_press(action::app(Message::TogglePinnedNotesSidebar))
+            .width(Length::Fill)
+            .padding([space_xxxs, space_s])
+            .class(style::Button::MenuItem);
+
+            content = content.push(header);
+
+            // List of pinned notes
+            for note in &self.pinned_notes {
+                let note_path = note.path.clone();
+                let note_button = button::custom(
+                    widget::row::with_capacity(2)
+                        .push(icon_cache_get("text-x-generic-symbolic", 16))
+                        .push(widget::text(&note.name).size(13))
+                        .spacing(space_xxs)
+                        .align_y(Alignment::Center),
+                )
+                .on_press(action::app(Message::OpenPinnedNote(note_path)))
+                .width(Length::Fill)
+                .padding([space_xxxs, space_s])
+                .class(style::Button::MenuItem);
+
+                content = content.push(note_button);
+            }
+
+            content = content.push(
+                widget::divider::horizontal::light(),
+            );
         }
 
-        Some(
-            nav.apply(widget::scrollable)
+        // Add project navigation if we have a model
+        if let Some(nav_model) = self.nav_model() {
+            let nav = segmented_button::vertical(nav_model)
+                .button_height(space_xxxs + 20 /* line height */ + space_xxxs)
+                .button_padding([space_s, space_xxxs, space_s, space_xxxs])
+                .button_spacing(space_xxxs)
+                .on_activate(|entity| action::cosmic(cosmic::app::Action::NavBar(entity)))
+                .spacing(space_none)
+                .style(theme::SegmentedButton::FileNav)
                 .apply(widget::container)
-                .height(Length::Fill)
-                .class(theme::Container::custom(nav_bar::nav_bar_style))
-                .into(),
-        )
+                .padding(space_s)
+                .width(Length::Fill);
+
+            content = content.push(nav);
+        }
+
+        // Determine nav bar width - use Fixed width to prevent flex allocation issues
+        // (max_width alone doesn't constrain the slot allocation in iced's flex layout)
+        let nav_width = if self.core().is_condensed() {
+            Length::Shrink
+        } else {
+            Length::Fixed(280.0)
+        };
+
+        let container = content
+            .apply(widget::scrollable)
+            .width(nav_width)
+            .apply(widget::container)
+            .width(nav_width)
+            .height(Length::Fill)
+            .class(theme::Container::custom(nav_bar::nav_bar_style));
+
+        Some(container.into())
     }
 
     fn nav_model(&self) -> Option<&nav_bar::Model> {
@@ -2308,7 +2404,10 @@ impl Application for App {
 
     //TODO: currently the first escape unfocuses, and the second calls this function
     fn on_escape(&mut self) -> Task<Message> {
-        if self.core.window.show_context {
+        if self.tab_bar_context_menu.is_some() {
+            // Close tab bar context menu if open
+            self.tab_bar_context_menu = None;
+        } else if self.core.window.show_context {
             // Close context drawer if open
             self.core.window.show_context = false;
         } else if self.find_opt.is_some() {
@@ -3816,6 +3915,8 @@ impl Application for App {
                 }
             },
             Message::TabActivate(entity) => {
+                // Close tab bar context menu if open
+                self.tab_bar_context_menu = None;
                 // Close save changes dialog if switching to a different tab for consistency
                 if self.dialog_page_opt != Some(DialogPage::PromptSaveClose(entity)) {
                     self.dialog_page_opt = None;
@@ -3936,6 +4037,9 @@ impl Application for App {
                     // Update context menu
                     tab.context_menu = position_opt;
                 }
+            }
+            Message::TabBarContextMenu(entity, position_opt) => {
+                self.tab_bar_context_menu = position_opt.map(|p| (entity, p));
             }
             Message::TabNext => {
                 let len = self.tab_model.iter().count();
@@ -4091,6 +4195,9 @@ impl Application for App {
             Message::ReopenOnStart(reopen_on_start) => {
                 config_set!(reopen_on_start, reopen_on_start);
             }
+            Message::SessionRestoreMode(mode) => {
+                config_set!(session_restore_mode, mode);
+            }
             Message::Focus(window_id) => {
                 if Some(window_id) == self.core.main_window_id() {
                     // focus the text box if context page is not shown
@@ -4154,6 +4261,8 @@ impl Application for App {
                         self.tab_model.icon_set(entity, icon);
                         self.update_watcher();
                         log::info!("Tab pinned successfully");
+                        // Refresh the pinned notes sidebar to show the new note
+                        return self.update(Message::RefreshPinnedNotes);
                     }
                     Err(pinned::PinError::FileAlreadyExists(path)) => {
                         log::warn!("Pinned file already exists: {:?}", path);
@@ -4178,6 +4287,47 @@ impl Application for App {
                     let title = tab.title();
                     self.tab_model.text_set(entity, title);
                 }
+            }
+            // Pinned notes sidebar messages
+            Message::TogglePinnedNotesSidebar => {
+                self.show_pinned_sidebar = !self.show_pinned_sidebar;
+                if self.show_pinned_sidebar {
+                    return self.update(Message::RefreshPinnedNotes);
+                }
+            }
+            Message::RefreshPinnedNotes => {
+                self.pinned_notes = pinned::scan_pinned_notes(&self.config.pinned_notes_dir);
+            }
+            Message::OpenPinnedNote(path) => {
+                // Check if already open
+                let existing = self.tab_model.iter().find(|&entity| {
+                    if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
+                        tab.path_opt.as_ref() == Some(&path)
+                    } else {
+                        false
+                    }
+                });
+
+                if let Some(entity) = existing {
+                    self.tab_model.activate(entity);
+                } else {
+                    // Open new tab, mark as pinned
+                    let mut tab = EditorTab::new(&self.config);
+                    tab.open(path);
+                    tab.is_pinned = true;
+                    let title = format!("\u{1F4CC} {}", tab.title());
+
+                    self.tab_model
+                        .insert()
+                        .text(title)
+                        .icon(tab.icon(16))
+                        .data::<Tab>(Tab::Editor(tab))
+                        .closable()
+                        .activate();
+
+                    self.update_watcher();
+                }
+                return self.update_tab();
             }
             // Markdown view mode messages
             Message::SetMarkdownViewMode(entity, mode) => {
@@ -4236,6 +4386,7 @@ impl Application for App {
             &self.config_state,
             &self.key_binds,
             &self.projects,
+            self.show_pinned_sidebar,
         )]
     }
 
@@ -4246,28 +4397,55 @@ impl Application for App {
             ..
         } = self.core().system_theme().cosmic().spacing;
 
-        let mut tab_column = widget::column::with_capacity(3).padding([space_none, space_xxs]);
+        let mut tab_column = widget::column::with_capacity(3)
+            .padding([space_none, space_xxs])
+            .width(Length::Fill);
 
-        tab_column = tab_column.push(
-            widget::row::with_capacity(2)
-                .align_y(Alignment::Center)
-                .push(
-                    widget::tab_bar::horizontal(&self.tab_model)
-                        .button_height(32)
-                        .button_spacing(space_xxs)
-                        .close_icon(icon_cache_get("window-close-symbolic", 16))
-                        //TODO: this causes issues with small window sizes .minimum_button_width(240)
-                        .on_activate(Message::TabActivate)
-                        .on_close(Message::TabClose)
-                        .width(Length::Shrink),
-                )
-                .push(
-                    button::custom(icon_cache_get("list-add-symbolic", 16))
-                        .on_press(Message::NewFile)
-                        .padding(space_xxs)
-                        .class(style::Button::Icon),
-                ),
-        );
+        // Build context menu items for tab bar
+        // We need to determine which entity was right-clicked to build correct menu
+        let tab_bar_context_menu_items: Option<Vec<widget::menu::Tree<Message>>> =
+            if let Some((entity, _)) = self.tab_bar_context_menu {
+                // Build menu items for this specific tab
+                let is_pinned = self
+                    .tab_model
+                    .data::<Tab>(entity)
+                    .map(|t| matches!(t, Tab::Editor(tab) if tab.is_pinned))
+                    .unwrap_or(false);
+                let is_markdown = self
+                    .tab_model
+                    .data::<Tab>(entity)
+                    .map(|t| matches!(t, Tab::Editor(tab) if tab.is_markdown()))
+                    .unwrap_or(false);
+
+                Some(menu::tab_context_menu(&self.key_binds, entity, is_pinned, is_markdown))
+            } else {
+                // Provide placeholder menu to enable on_context callback
+                // The actual menu will be built after on_context fires and updates state
+                Some(vec![])
+            };
+
+        // Build tab bar with context menu support
+        let tab_bar = widget::tab_bar::horizontal(&self.tab_model)
+            .button_height(32)
+            .button_spacing(space_xxs)
+            .close_icon(icon_cache_get("window-close-symbolic", 16))
+            .on_activate(Message::TabActivate)
+            .on_close(Message::TabClose)
+            .context_menu(tab_bar_context_menu_items)
+            .on_context(|entity| Message::TabBarContextMenu(entity, Some(Point::ORIGIN)))
+            .width(Length::Shrink);
+
+        let tab_bar_row = widget::row::with_capacity(2)
+            .align_y(Alignment::Center)
+            .push(tab_bar)
+            .push(
+                button::custom(icon_cache_get("list-add-symbolic", 16))
+                    .on_press(Message::NewFile)
+                    .padding(space_xxs)
+                    .class(style::Button::Icon),
+            );
+
+        tab_column = tab_column.push(tab_bar_row);
 
         let tab_id = self.tab_model.active();
         match self.tab_model.data::<Tab>(tab_id) {

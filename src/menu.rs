@@ -83,79 +83,95 @@ pub fn context_menu<'a>(
     .into()
 }
 
+/// Actions for the tab bar context menu
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabContextAction {
+    Pin(segmented_button::Entity),
+    Unpin(segmented_button::Entity),
+    Close(segmented_button::Entity),
+    MarkdownRaw(segmented_button::Entity),
+    MarkdownRendered(segmented_button::Entity),
+    MarkdownSplit(segmented_button::Entity),
+}
+
+impl widget::menu::Action for TabContextAction {
+    type Message = Message;
+
+    fn message(&self) -> Message {
+        use crate::tab::MarkdownViewMode;
+        match *self {
+            TabContextAction::Pin(entity) => Message::TabPin(entity),
+            TabContextAction::Unpin(entity) => Message::TabUnpin(entity),
+            TabContextAction::Close(entity) => Message::TabClose(entity),
+            TabContextAction::MarkdownRaw(entity) => {
+                Message::SetMarkdownViewMode(entity, MarkdownViewMode::Raw)
+            }
+            TabContextAction::MarkdownRendered(entity) => {
+                Message::SetMarkdownViewMode(entity, MarkdownViewMode::Rendered)
+            }
+            TabContextAction::MarkdownSplit(entity) => {
+                Message::SetMarkdownViewMode(entity, MarkdownViewMode::Split)
+            }
+        }
+    }
+}
+
 /// Context menu for right-clicking on a tab in the tab bar.
-pub fn tab_context_menu<'a>(
+/// Returns menu items suitable for libcosmic's context_menu system.
+pub fn tab_context_menu(
+    _key_binds: &HashMap<KeyBind, Action>,
     entity: segmented_button::Entity,
     is_pinned: bool,
     is_markdown: bool,
-) -> Element<'a, Message> {
-    use crate::tab::MarkdownViewMode;
-
-    let mut items: Vec<Element<'a, Message>> = Vec::new();
+) -> Vec<widget::menu::Tree<Message>> {
+    let mut items = Vec::new();
 
     // Pin/Unpin option
     if is_pinned {
-        items.push(
-            menu_button(vec![widget::text(fl!("unpin-tab")).into()])
-                .on_press(Message::TabUnpin(entity))
-                .into(),
-        );
+        items.push(MenuItem::Button(
+            fl!("unpin-tab"),
+            None,
+            TabContextAction::Unpin(entity),
+        ));
     } else {
-        items.push(
-            menu_button(vec![widget::text(fl!("pin-tab")).into()])
-                .on_press(Message::TabPin(entity))
-                .into(),
-        );
+        items.push(MenuItem::Button(
+            fl!("pin-tab"),
+            None,
+            TabContextAction::Pin(entity),
+        ));
     }
 
     // Markdown view mode options (only for markdown files)
     if is_markdown {
-        items.push(divider::horizontal::light().into());
-        items.push(widget::text(fl!("view-mode")).size(12).into());
-        items.push(
-            menu_button(vec![widget::text(fl!("view-raw")).into()])
-                .on_press(Message::SetMarkdownViewMode(entity, MarkdownViewMode::Raw))
-                .into(),
-        );
-        items.push(
-            menu_button(vec![widget::text(fl!("view-rendered")).into()])
-                .on_press(Message::SetMarkdownViewMode(entity, MarkdownViewMode::Rendered))
-                .into(),
-        );
-        items.push(
-            menu_button(vec![widget::text(fl!("view-split")).into()])
-                .on_press(Message::SetMarkdownViewMode(entity, MarkdownViewMode::Split))
-                .into(),
-        );
+        items.push(MenuItem::Divider);
+        items.push(MenuItem::Button(
+            fl!("view-raw"),
+            None,
+            TabContextAction::MarkdownRaw(entity),
+        ));
+        items.push(MenuItem::Button(
+            fl!("view-rendered"),
+            None,
+            TabContextAction::MarkdownRendered(entity),
+        ));
+        items.push(MenuItem::Button(
+            fl!("view-split"),
+            None,
+            TabContextAction::MarkdownSplit(entity),
+        ));
     }
 
     // Close tab option
-    items.push(divider::horizontal::light().into());
-    items.push(
-        menu_button(vec![widget::text(fl!("close-file")).into()])
-            .on_press(Message::TabClose(entity))
-            .into(),
-    );
+    items.push(MenuItem::Divider);
+    items.push(MenuItem::Button(
+        fl!("close-file"),
+        None,
+        TabContextAction::Close(entity),
+    ));
 
-    widget::container(column(items))
-        .padding(1)
-        .style(|theme| {
-            let cosmic = theme.cosmic();
-            let component = &cosmic.background.component;
-            widget::container::Style {
-                icon_color: Some(component.on.into()),
-                text_color: Some(component.on.into()),
-                background: Some(Background::Color(component.base.into())),
-                border: Border {
-                    radius: cosmic.radius_s().map(|x| x + 1.0).into(),
-                    width: 1.0,
-                    color: component.divider.into(),
-                },
-                ..Default::default()
-            }
-        })
-        .width(Length::Fixed(200.0))
-        .into()
+    // Use empty HashMap since TabContextAction has no key bindings
+    let empty_key_binds: HashMap<KeyBind, TabContextAction> = HashMap::new();
+    widget::menu::items(&empty_key_binds, items)
 }
 
 pub fn menu_bar<'a>(
@@ -164,6 +180,7 @@ pub fn menu_bar<'a>(
     config_state: &ConfigState,
     key_binds: &HashMap<KeyBind, Action>,
     projects: &Vec<(String, PathBuf)>,
+    show_pinned_sidebar: bool,
 ) -> Element<'a, Message> {
     //TODO: port to libcosmic
     let menu_tab_width = |tab_width: u16| {
@@ -281,6 +298,13 @@ pub fn menu_bar<'a>(
                 (
                     (fl!("view")),
                     vec![
+                        MenuItem::CheckBox(
+                            fl!("pinned-notes-sidebar"),
+                            None,
+                            show_pinned_sidebar,
+                            Action::TogglePinnedSidebar,
+                        ),
+                        MenuItem::Divider,
                         MenuItem::Folder(
                             fl!("indentation"),
                             vec![

@@ -154,6 +154,15 @@ pin-tab-title = Pin Tab
 pin-tab-body = Enter a name for this pinned note:
 pin-name-placeholder = Note name
 
+# Pinned notes sidebar
+pinned-notes = Pinned Notes
+pinned-notes-sidebar = Pinned notes sidebar
+
+# Session restore
+session-restore-mode = Session restore mode
+session-restore-separate = Separate windows
+session-restore-single = Single window
+
 # Markdown view
 view-mode = View Mode
 view-raw = Raw
