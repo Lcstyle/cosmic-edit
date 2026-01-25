@@ -8,7 +8,10 @@ use cosmic::{
 };
 use cosmic_text::Metrics;
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+};
 
 pub const CONFIG_VERSION: u64 = 1;
 
@@ -71,10 +74,20 @@ pub struct Config {
     /// Default: 5 MB. Set to 0 to disable limit.
     #[serde(default = "default_max_hash_file_size_mb")]
     pub max_hash_file_size_mb: u64,
+    /// Directory for pinned notes.
+    /// Pinned tabs are saved as markdown files in this directory.
+    #[serde(default = "default_pinned_notes_dir")]
+    pub pinned_notes_dir: PathBuf,
 }
 
 fn default_max_hash_file_size_mb() -> u64 {
     5
+}
+
+fn default_pinned_notes_dir() -> PathBuf {
+    dirs::document_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
+        .join("cosmic-pinned-notes")
 }
 
 fn default_true() -> bool {
@@ -109,6 +122,7 @@ impl Default for Config {
             vim_bindings: false,
             word_wrap: true,
             max_hash_file_size_mb: 5,
+            pinned_notes_dir: default_pinned_notes_dir(),
         }
     }
 }
