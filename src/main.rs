@@ -4210,36 +4210,68 @@ impl Application for App {
         let tab_id = self.tab_model.active();
         match self.tab_model.data::<Tab>(tab_id) {
             Some(Tab::Editor(tab)) => {
-                let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
-                    .id(self.text_box_id.clone())
-                    .on_focus(Message::FindFocused(false))
-                    .on_auto_scroll(Message::AutoScroll)
-                    .on_changed(Message::TabChanged(tab_id))
-                    .on_edit(Message::TabEdit(tab_id))
-                    .on_scroll(Message::ScrollChanged)
-                    .has_context_menu(tab.context_menu.is_some())
-                    .on_context_menu(move |position_opt| {
-                        Message::TabContextMenu(tab_id, position_opt)
-                    });
-                if self.config.highlight_current_line {
-                    text_box = text_box.highlight_current_line();
+                // Check if this is a markdown file with a non-Raw view mode
+                let is_markdown = tab.is_markdown();
+                let view_mode = tab.markdown_view_mode;
+
+                // Build the text editor widget (used in Raw and Split modes)
+                let build_editor = || {
+                    let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
+                        .id(self.text_box_id.clone())
+                        .on_focus(Message::FindFocused(false))
+                        .on_auto_scroll(Message::AutoScroll)
+                        .on_changed(Message::TabChanged(tab_id))
+                        .on_edit(Message::TabEdit(tab_id))
+                        .on_scroll(Message::ScrollChanged)
+                        .has_context_menu(tab.context_menu.is_some())
+                        .on_context_menu(move |position_opt| {
+                            Message::TabContextMenu(tab_id, position_opt)
+                        });
+                    if self.config.highlight_current_line {
+                        text_box = text_box.highlight_current_line();
+                    }
+                    if self.config.line_numbers {
+                        text_box = text_box.line_numbers();
+                    }
+                    // Apply line number offset and total lines for large file windowed buffers
+                    if tab.uses_rope_buffer() {
+                        text_box = text_box
+                            .line_number_offset(tab.line_number_offset())
+                            .total_lines(tab.total_line_count());
+                    }
+                    let mut popover = widget::popover(text_box);
+                    if let Some(point) = tab.context_menu {
+                        popover = popover
+                            .popup(menu::context_menu(&self.key_binds, tab_id))
+                            .position(widget::popover::Position::Point(point));
+                    }
+                    popover
+                };
+
+                // Render based on view mode
+                match (is_markdown, view_mode) {
+                    (true, tab::MarkdownViewMode::Rendered) => {
+                        // Rendered-only view for markdown
+                        let content = tab.text();
+                        tab_column = tab_column.push(markdown_view::markdown_view(&content));
+                    }
+                    (true, tab::MarkdownViewMode::Split) => {
+                        // Split view: editor on left, rendered on right
+                        let content = tab.text();
+                        let editor = build_editor();
+                        let rendered = markdown_view::markdown_view(&content);
+                        let split_view = widget::row::with_capacity(2)
+                            .push(widget::container(editor).width(Length::FillPortion(1)))
+                            .push(widget::divider::vertical::light())
+                            .push(widget::container(rendered).width(Length::FillPortion(1)))
+                            .spacing(4);
+                        tab_column = tab_column.push(split_view);
+                    }
+                    _ => {
+                        // Raw mode (default) or non-markdown files
+                        tab_column = tab_column.push(build_editor());
+                    }
                 }
-                if self.config.line_numbers {
-                    text_box = text_box.line_numbers();
-                }
-                // Apply line number offset and total lines for large file windowed buffers
-                if tab.uses_rope_buffer() {
-                    text_box = text_box
-                        .line_number_offset(tab.line_number_offset())
-                        .total_lines(tab.total_line_count());
-                }
-                let mut popover = widget::popover(text_box);
-                if let Some(point) = tab.context_menu {
-                    popover = popover
-                        .popup(menu::context_menu(&self.key_binds, tab_id))
-                        .position(widget::popover::Position::Point(point));
-                }
-                tab_column = tab_column.push(popover);
                 if self.config.vim_bindings {
                     let status = {
                         let editor = tab.editor.lock().unwrap();
