@@ -65,6 +65,11 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
     bind!([Ctrl], Key::Character(",".into()), ToggleSettingsPage);
     bind!([Alt], Key::Character("z".into()), ToggleWordWrap);
     bind!([Ctrl], Key::Character("z".into()), Undo);
+    bind!(
+        [Ctrl, Shift],
+        Key::Character("M".into()),
+        ToggleMarkdownViewMode
+    );
 
     key_binds
 }

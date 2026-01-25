@@ -239,6 +239,7 @@ pub enum Action {
     ToggleSettingsPage,
     ListMatchesSelection,
     ToggleWordWrap,
+    ToggleMarkdownViewMode,
     Undo,
     ZoomIn,
     ZoomOut,
@@ -292,6 +293,14 @@ impl Action {
             Self::ToggleSettingsPage => Message::ToggleContextPage(ContextPage::Settings),
             Self::ListMatchesSelection => Message::ListMatchesSelection,
             Self::ToggleWordWrap => Message::ToggleWordWrap,
+            Self::ToggleMarkdownViewMode => {
+                if let Some(entity) = entity_opt {
+                    Message::ToggleMarkdownViewMode(entity)
+                } else {
+                    // If no entity provided, this is a no-op
+                    Message::Todo
+                }
+            }
             Self::Undo => Message::Undo,
             Self::ZoomIn => Message::ZoomIn,
             Self::ZoomOut => Message::ZoomOut,
@@ -3088,7 +3097,12 @@ impl Application for App {
             Message::Key(modifiers, key) => {
                 for (key_bind, action) in self.key_binds.iter() {
                     if key_bind.matches(modifiers, &key) {
-                        return self.update(action.message(None));
+                        // For actions that need the active tab entity
+                        let entity_opt = match action {
+                            Action::ToggleMarkdownViewMode => Some(self.tab_model.active()),
+                            _ => None,
+                        };
+                        return self.update(action.message(entity_opt));
                     }
                 }
             }
