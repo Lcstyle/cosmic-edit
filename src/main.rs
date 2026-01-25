@@ -44,6 +44,7 @@ mod config;
 
 mod backup;
 mod hotexit;
+mod pinned;
 
 use git::{GitDiff, GitDiffLine, GitRepository, GitStatus, GitStatusKind};
 mod git;
