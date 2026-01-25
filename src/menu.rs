@@ -83,6 +83,81 @@ pub fn context_menu<'a>(
     .into()
 }
 
+/// Context menu for right-clicking on a tab in the tab bar.
+pub fn tab_context_menu<'a>(
+    entity: segmented_button::Entity,
+    is_pinned: bool,
+    is_markdown: bool,
+) -> Element<'a, Message> {
+    use crate::tab::MarkdownViewMode;
+
+    let mut items: Vec<Element<'a, Message>> = Vec::new();
+
+    // Pin/Unpin option
+    if is_pinned {
+        items.push(
+            menu_button(vec![widget::text(fl!("unpin-tab")).into()])
+                .on_press(Message::TabUnpin(entity))
+                .into(),
+        );
+    } else {
+        items.push(
+            menu_button(vec![widget::text(fl!("pin-tab")).into()])
+                .on_press(Message::TabPin(entity))
+                .into(),
+        );
+    }
+
+    // Markdown view mode options (only for markdown files)
+    if is_markdown {
+        items.push(divider::horizontal::light().into());
+        items.push(widget::text(fl!("view-mode")).size(12).into());
+        items.push(
+            menu_button(vec![widget::text(fl!("view-raw")).into()])
+                .on_press(Message::SetMarkdownViewMode(entity, MarkdownViewMode::Raw))
+                .into(),
+        );
+        items.push(
+            menu_button(vec![widget::text(fl!("view-rendered")).into()])
+                .on_press(Message::SetMarkdownViewMode(entity, MarkdownViewMode::Rendered))
+                .into(),
+        );
+        items.push(
+            menu_button(vec![widget::text(fl!("view-split")).into()])
+                .on_press(Message::SetMarkdownViewMode(entity, MarkdownViewMode::Split))
+                .into(),
+        );
+    }
+
+    // Close tab option
+    items.push(divider::horizontal::light().into());
+    items.push(
+        menu_button(vec![widget::text(fl!("close-file")).into()])
+            .on_press(Message::TabClose(entity))
+            .into(),
+    );
+
+    widget::container(column(items))
+        .padding(1)
+        .style(|theme| {
+            let cosmic = theme.cosmic();
+            let component = &cosmic.background.component;
+            widget::container::Style {
+                icon_color: Some(component.on.into()),
+                text_color: Some(component.on.into()),
+                background: Some(Background::Color(component.base.into())),
+                border: Border {
+                    radius: cosmic.radius_s().map(|x| x + 1.0).into(),
+                    width: 1.0,
+                    color: component.divider.into(),
+                },
+                ..Default::default()
+            }
+        })
+        .width(Length::Fixed(200.0))
+        .into()
+}
+
 pub fn menu_bar<'a>(
     core: &Core,
     config: &Config,
