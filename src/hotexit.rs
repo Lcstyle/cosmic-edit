@@ -103,6 +103,9 @@ pub struct SessionTab {
     pub has_unsaved_changes: bool,
     /// Backup ID for tabs with unsaved changes
     pub backup_id: Option<String>,
+    /// Whether this tab is pinned
+    #[serde(default)]
+    pub is_pinned: bool,
 }
 
 /// A project entry in the session state
@@ -800,11 +803,15 @@ pub enum RestoredTab {
         backup_id: String,
         /// Hash of the content
         content_hash: u64,
+        /// Whether this tab is pinned
+        is_pinned: bool,
     },
     /// Tab restored from file (no unsaved changes)
     FromFile {
         /// File path to open
         path: PathBuf,
+        /// Whether this tab is pinned
+        is_pinned: bool,
     },
 }
 
@@ -833,6 +840,7 @@ pub fn load_session_tabs(session: &SessionState) -> Vec<RestoredTab> {
                         zoom_adj: cached_doc.zoom_adj(),
                         backup_id: cached_doc.id().to_string(),
                         content_hash: compute_content_hash(&cached_doc.content),
+                        is_pinned: session_tab.is_pinned,
                     });
                     continue;
                 }
@@ -847,7 +855,10 @@ pub fn load_session_tabs(session: &SessionState) -> Vec<RestoredTab> {
         // Restore from file (no unsaved changes or backup not found)
         if let Some(path) = &session_tab.path {
             if path.exists() {
-                tabs.push(RestoredTab::FromFile { path: path.clone() });
+                tabs.push(RestoredTab::FromFile {
+                    path: path.clone(),
+                    is_pinned: session_tab.is_pinned,
+                });
             }
         }
     }

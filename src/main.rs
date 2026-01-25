@@ -724,6 +724,7 @@ impl App {
                     path: tab.path_opt.clone(),
                     has_unsaved_changes: has_unsaved,
                     backup_id: tab.backup_id.clone(),
+                    is_pinned: tab.is_pinned,
                 });
 
                 if entity == active_entity {
@@ -892,6 +893,7 @@ impl App {
                     zoom_adj,
                     backup_id,
                     content_hash,
+                    is_pinned,
                 } => {
                     let mut tab = EditorTab::new(&self.config);
                     tab.path_opt = path_opt;
@@ -900,9 +902,13 @@ impl App {
                     tab.zoom_adj = zoom_adj;
                     tab.backup_id = Some(backup_id);
                     tab.backup_content_hash = Some(content_hash);
+                    tab.is_pinned = is_pinned;
 
                     // Add tab with unsaved indicator
                     let mut title = tab.title();
+                    if is_pinned {
+                        title = format!("\u{1F4CC} {}", title);
+                    }
                     title.push_str(" \u{2022}");
                     self.tab_model
                         .insert()
@@ -912,12 +918,17 @@ impl App {
                         .closable()
                         .activate();
                 }
-                hotexit::RestoredTab::FromFile { path } => {
+                hotexit::RestoredTab::FromFile { path, is_pinned } => {
                     let mut tab = EditorTab::new(&self.config);
                     tab.open(path);
+                    tab.is_pinned = is_pinned;
+                    let mut title = tab.title();
+                    if is_pinned {
+                        title = format!("\u{1F4CC} {}", title);
+                    }
                     self.tab_model
                         .insert()
-                        .text(tab.title())
+                        .text(title)
                         .icon(tab.icon(16))
                         .data::<Tab>(Tab::Editor(tab))
                         .closable()

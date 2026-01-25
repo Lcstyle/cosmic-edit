@@ -7,6 +7,7 @@ use cosmic::{
 use cosmic_files::mime_icon::{FALLBACK_MIME_ICON, mime_for_path, mime_icon};
 use cosmic_text::{Attrs, Buffer, Cursor, Edit, Metrics, RopeBuffer, Selection, Shaping, SyntaxEditor, ViEditor, Wrap};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::{
     fmt, fs,
     io::{self, Write},
@@ -80,6 +81,29 @@ impl CursorPosition {
     }
 }
 
+/// View mode for markdown files.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MarkdownViewMode {
+    /// Raw text editing view (default)
+    #[default]
+    Raw,
+    /// Rendered markdown view (read-only)
+    Rendered,
+    /// Split view with editor and rendered side-by-side
+    Split,
+}
+
+impl MarkdownViewMode {
+    /// Cycle to the next view mode
+    pub fn next(self) -> Self {
+        match self {
+            Self::Raw => Self::Rendered,
+            Self::Rendered => Self::Split,
+            Self::Split => Self::Raw,
+        }
+    }
+}
+
 /// File size threshold (in bytes) above which we set a minimal buffer height
 /// before loading to prevent shaping all lines at once.
 /// This prevents the 313x memory multiplier crash on large files.
@@ -149,6 +173,11 @@ pub struct EditorTab {
     rope_window_start: usize,
     /// End line of the currently loaded window (for large files).
     rope_window_end: usize,
+
+    /// Whether this tab is pinned (saved to pinned notes directory).
+    pub is_pinned: bool,
+    /// View mode for markdown files.
+    pub markdown_view_mode: MarkdownViewMode,
 }
 
 impl EditorTab {
@@ -186,6 +215,8 @@ impl EditorTab {
             metrics,
             rope_window_start: 0,
             rope_window_end: 0,
+            is_pinned: false,
+            markdown_view_mode: MarkdownViewMode::default(),
         };
 
         // Update any other config settings
@@ -684,6 +715,15 @@ impl EditorTab {
             Some(path) => icon::icon(mime_icon(mime_for_path(path, None, false), size)).size(size),
             None => icon::from_name(FALLBACK_MIME_ICON).size(size).icon(),
         }
+    }
+
+    /// Check if this tab contains a markdown file.
+    pub fn is_markdown(&self) -> bool {
+        self.path_opt
+            .as_ref()
+            .and_then(|p| p.extension())
+            .map(|ext| ext == "md" || ext == "markdown")
+            .unwrap_or(false)
     }
 
     pub fn title(&self) -> String {
