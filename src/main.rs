@@ -42,6 +42,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use config::{AppTheme, CONFIG_VERSION, Config, ConfigState};
 mod config;
 
+mod ai;
 mod backup;
 mod hotexit;
 mod markdown_view;
@@ -463,6 +464,8 @@ pub enum Message {
     PinNameValueChanged(String),
     PinNameConfirmed(segmented_button::Entity, String),
     PinNameCancelled,
+    AiSuggestionReceived(String),
+    AnthropicApiKeyChanged(String),
     TabPin(segmented_button::Entity),
     TabUnpin(segmented_button::Entity),
     // Pinned notes sidebar messages
@@ -550,6 +553,10 @@ pub struct App {
     pin_name_value: String,
     /// Widget ID for the pin name text input
     pin_name_id: widget::Id,
+    /// Whether an AI suggestion has been received (to avoid overwriting user edits)
+    ai_suggestion_received: bool,
+    /// Whether we're waiting for an AI suggestion (shows spinner in UI)
+    ai_suggesting: bool,
     /// Whether the pinned notes sidebar is visible
     show_pinned_sidebar: bool,
     /// Cached list of pinned notes from the directory
@@ -1955,6 +1962,22 @@ impl App {
                 )
                 .into(),
             widget::settings::section()
+                .title(fl!("ai-features"))
+                .add(
+                    widget::settings::item::builder(fl!("anthropic-api-key"))
+                        .description(fl!("anthropic-api-key-description"))
+                        .control(
+                            widget::text_input(
+                                fl!("anthropic-api-key-placeholder"),
+                                self.config.anthropic_api_key.as_deref().unwrap_or(""),
+                            )
+                            .on_input(Message::AnthropicApiKeyChanged)
+                            .password()
+                            .width(Length::Fixed(300.0)),
+                        ),
+                )
+                .into(),
+            widget::settings::section()
                 .title(fl!("appearance"))
                 .add(
                     widget::settings::item::builder(fl!("theme")).control(widget::dropdown(
@@ -2052,6 +2075,9 @@ impl Application for App {
                 .db_mut()
                 .set_monospace_family(&flags.config.font_name);
         }
+
+        // Load AI configuration
+        ai::load_config();
 
         let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
         let session_restore_modes = vec![
@@ -2155,6 +2181,8 @@ impl Application for App {
             pending_saves: HashMap::new(),
             pin_name_value: String::new(),
             pin_name_id: widget::Id::unique(),
+            ai_suggestion_received: false,
+            ai_suggesting: false,
             show_pinned_sidebar: false,
             pinned_notes: Vec::new(),
             tab_bar_context_menu: None,
@@ -2629,11 +2657,33 @@ impl Application for App {
                     .on_input(Message::PinNameValueChanged)
                     .on_submit(move |_| Message::PinNameConfirmed(entity, pin_name.clone()));
 
+                // Build control with optional loading indicator
+                let control: Element<'_, Message> = if self.ai_suggesting {
+                    // Show text input with loading indicator
+                    widget::column::with_children(vec![
+                        text_input.into(),
+                        widget::row::with_children(vec![
+                            icon::from_name("content-loading-symbolic")
+                                .size(16)
+                                .into(),
+                            widget::text::body(fl!("ai-suggesting"))
+                                .into(),
+                        ])
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into(),
+                    ])
+                    .spacing(8)
+                    .into()
+                } else {
+                    text_input.into()
+                };
+
                 let dialog = widget::dialog()
                     .title(fl!("pin-tab-title"))
                     .body(fl!("pin-tab-body"))
                     .icon(icon::from_name("bookmark-new-symbolic").size(64))
-                    .control(text_input)
+                    .control(control)
                     .primary_action(pin_button)
                     .secondary_action(cancel_button);
 
@@ -4198,6 +4248,29 @@ impl Application for App {
             Message::SessionRestoreMode(mode) => {
                 config_set!(session_restore_mode, mode);
             }
+            Message::AnthropicApiKeyChanged(key) => {
+                let key_opt = if key.trim().is_empty() {
+                    None
+                } else {
+                    Some(key)
+                };
+                config_set!(anthropic_api_key, key_opt);
+            }
+            Message::AiSuggestionReceived(suggestion) => {
+                // Stop showing spinner
+                self.ai_suggesting = false;
+
+                // Update the pin name field with AI suggestion if user hasn't edited manually
+                if !self.ai_suggestion_received {
+                    self.ai_suggestion_received = true;
+                    if suggestion.is_empty() {
+                        // AI returned nothing, use default
+                        self.pin_name_value = fl!("new-document");
+                    } else {
+                        self.pin_name_value = suggestion;
+                    }
+                }
+            }
             Message::Focus(window_id) => {
                 if Some(window_id) == self.core.main_window_id() {
                     // focus the text box if context page is not shown
@@ -4208,28 +4281,68 @@ impl Application for App {
             }
             // Pinned tabs messages
             Message::PromptPinName(entity) => {
-                // Pre-fill with tab title or default name
-                let default_name = if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
-                    if let Some(path) = &tab.path_opt {
+                // Reset AI suggestion state
+                self.ai_suggestion_received = false;
+                self.ai_suggesting = false;
+
+                // Get content for AI suggestion
+                let (default_name, content) = if let Some(Tab::Editor(tab)) =
+                    self.tab_model.data::<Tab>(entity)
+                {
+                    let name = if let Some(path) = &tab.path_opt {
                         path.file_stem()
                             .and_then(|s| s.to_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| fl!("new-document"))
                     } else {
                         fl!("new-document")
-                    }
+                    };
+                    (name, tab.text())
                 } else {
-                    fl!("new-document")
+                    (fl!("new-document"), String::new())
                 };
-                self.pin_name_value = default_name;
+
+                // Start with empty field if AI is available, otherwise use default name
+                let will_use_ai = self.config.anthropic_api_key.is_some()
+                    && !content.is_empty()
+                    && content.len() <= self.config.ai_max_content_size;
+
+                if will_use_ai {
+                    self.pin_name_value = String::new();
+                    self.ai_suggesting = true;
+                } else {
+                    self.pin_name_value = default_name.clone();
+                }
+
                 self.dialog_page_opt = Some(DialogPage::PromptPinName(entity));
-                return widget::text_input::focus(self.pin_name_id.clone());
+
+                // Start async AI suggestion if API key is configured
+                let tasks = vec![widget::text_input::focus(self.pin_name_id.clone())];
+                if will_use_ai {
+                    let api_key = self.config.anthropic_api_key.clone().unwrap();
+                    let task = Task::perform(
+                        async move { ai::suggest_filename(&api_key, &content).await },
+                        |result| {
+                            let suggestion = result.unwrap_or_default();
+                            action::app(Message::AiSuggestionReceived(suggestion))
+                        },
+                    );
+                    return Task::batch(tasks).chain(task);
+                }
+                return Task::batch(tasks);
             }
             Message::PinNameValueChanged(value) => {
+                // If user starts typing, mark as having received user input
+                // so AI suggestion won't overwrite what they typed
+                if !self.ai_suggestion_received && !value.is_empty() {
+                    self.ai_suggestion_received = true;
+                    self.ai_suggesting = false; // Stop showing spinner
+                }
                 self.pin_name_value = value;
             }
             Message::PinNameConfirmed(entity, name) => {
                 self.dialog_page_opt = None;
+                self.ai_suggesting = false;
                 if name.trim().is_empty() {
                     return Task::none();
                 }
@@ -4276,6 +4389,7 @@ impl Application for App {
             Message::PinNameCancelled => {
                 self.dialog_page_opt = None;
                 self.pin_name_value.clear();
+                self.ai_suggesting = false;
             }
             Message::TabPin(entity) => {
                 return self.update(Message::PromptPinName(entity));

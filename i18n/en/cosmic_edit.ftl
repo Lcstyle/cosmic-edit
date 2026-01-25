@@ -163,6 +163,13 @@ session-restore-mode = Session restore mode
 session-restore-separate = Separate windows
 session-restore-single = Single window
 
+# AI features
+ai-features = AI Features
+anthropic-api-key = Anthropic API Key
+anthropic-api-key-placeholder = Enter your API key...
+anthropic-api-key-description = Used for AI-powered filename suggestions when pinning notes
+ai-suggesting = Suggesting name...
+
 # Markdown view
 view-mode = View Mode
 view-raw = Raw

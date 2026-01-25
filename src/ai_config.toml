@@ -1,0 +1,33 @@
+# AI Configuration for Cosmic Edit
+# This file contains prompts and settings used for AI-powered features.
+# You can edit these settings to customize AI behavior.
+#
+# Copy this file to ~/.config/com.system76.CosmicEdit/ai_config.toml
+# to override the defaults.
+
+[filename_suggestion]
+# Model to use for filename suggestions
+# Options: claude-3-5-haiku-latest (fast, cheap), claude-3-5-sonnet-latest (smarter)
+model = "claude-3-5-haiku-latest"
+
+# Maximum tokens for the response (keep low for short filenames)
+max_tokens = 50
+
+# Maximum content length (in bytes) to send to the AI for analysis
+# Larger files are truncated to this length
+max_content_length = 50000
+
+# The prompt template for suggesting filenames.
+# {content} will be replaced with the document content.
+prompt = """Based on the following document content, suggest a short, descriptive filename (without extension).
+The filename should:
+- Be 2-5 words, lowercase, separated by hyphens
+- Capture the main topic or purpose of the document
+- Be suitable for a markdown note file
+
+Respond with ONLY the suggested filename, nothing else. No quotes, no extension, no explanation.
+
+Document content:
+---
+{content}
+---"""

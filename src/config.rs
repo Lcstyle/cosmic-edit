@@ -91,6 +91,19 @@ pub struct Config {
     /// Pinned tabs are saved as markdown files in this directory.
     #[serde(default = "default_pinned_notes_dir")]
     pub pinned_notes_dir: PathBuf,
+    /// Anthropic API key for AI-powered features (filename suggestions).
+    /// If not set, AI features are disabled.
+    #[serde(default)]
+    pub anthropic_api_key: Option<String>,
+    /// Maximum file size (in bytes) to send to AI for analysis.
+    /// Files larger than this won't get AI-powered filename suggestions.
+    /// Default: 1MB (1048576 bytes).
+    #[serde(default = "default_ai_max_content_size")]
+    pub ai_max_content_size: usize,
+}
+
+fn default_ai_max_content_size() -> usize {
+    1024 * 1024 // 1 MB
 }
 
 fn default_max_hash_file_size_mb() -> u64 {
@@ -137,6 +150,8 @@ impl Default for Config {
             word_wrap: true,
             max_hash_file_size_mb: 5,
             pinned_notes_dir: default_pinned_notes_dir(),
+            anthropic_api_key: None,
+            ai_max_content_size: default_ai_max_content_size(),
         }
     }
 }
