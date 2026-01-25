@@ -2178,6 +2178,54 @@ impl Application for App {
 
         app.update_nav_bar_placeholder();
 
+        // Load pinned tabs from the pinned notes directory
+        let pinned_notes = pinned::scan_pinned_notes(&app.config.pinned_notes_dir);
+        let had_pinned_notes = !pinned_notes.is_empty();
+        for note in pinned_notes {
+            // Check if this file is already open
+            let existing_entity = app.tab_model.iter().find(|entity| {
+                if let Some(Tab::Editor(tab)) = app.tab_model.data::<Tab>(*entity) {
+                    tab.path_opt.as_ref() == Some(&note.path)
+                } else {
+                    false
+                }
+            });
+
+            if let Some(entity) = existing_entity {
+                // Mark existing tab as pinned if it's in the pinned directory
+                let title = if let Some(Tab::Editor(tab)) = app.tab_model.data_mut::<Tab>(entity) {
+                    if !tab.is_pinned {
+                        tab.is_pinned = true;
+                        Some(format!("\u{1F4CC} {}", tab.title()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(title) = title {
+                    app.tab_model.text_set(entity, title);
+                }
+            } else {
+                // Open new pinned tab
+                let mut tab = EditorTab::new(&app.config);
+                tab.open(note.path);
+                tab.is_pinned = true;
+                let title = format!("\u{1F4CC} {}", tab.title());
+                // Insert pinned tabs at the beginning of the tab bar
+                app.tab_model
+                    .insert()
+                    .position(0)
+                    .text(title)
+                    .icon(tab.icon(16))
+                    .data::<Tab>(Tab::Editor(tab))
+                    .closable();
+            }
+        }
+        if had_pinned_notes {
+            app.update_watcher();
+        }
+
         // Open an empty file if no tabs were restored and no dialog is showing
         if app.tab_model.iter().next().is_none() && app.dialog_page_opt.is_none() {
             app.open_tab(None);
