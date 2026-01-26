@@ -460,7 +460,8 @@ pub enum Message {
     ReopenOnStart(bool),
     SessionRestoreMode(config::SessionRestoreMode),
     // Pinned tabs messages
-    PromptPinName(segmented_button::Entity),
+    /// Prompt user to enter a name for a pinned tab. Bool is skip_ai flag.
+    PromptPinName(segmented_button::Entity, bool),
     PinNameValueChanged(String),
     PinNameConfirmed(segmented_button::Entity, String),
     PinNameCancelled,
@@ -498,8 +499,8 @@ enum DialogPage {
     PromptSaveQuit(Vec<segmented_button::Entity>),
     /// Prompt user to select how to handle multiple orphaned sessions.
     PromptRestoreSessions(Vec<u64>, RestoreOption),
-    /// Prompt user to enter a name for a pinned tab.
-    PromptPinName(segmented_button::Entity),
+    /// Prompt user to enter a name for a pinned tab. Bool tracks if AI was bypassed.
+    PromptPinName(segmented_button::Entity, bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1418,7 +1419,7 @@ impl App {
             Some(DialogPage::PromptRestoreSessions(_, _)) => {
                 // Session restore dialog doesn't need periodic updates
             }
-            Some(DialogPage::PromptPinName(_)) => {
+            Some(DialogPage::PromptPinName(_, _)) => {
                 // Pin name dialog doesn't need periodic updates
             }
             None => {}
@@ -2676,8 +2677,9 @@ impl Application for App {
 
                 Some(dialog.into())
             }
-            DialogPage::PromptPinName(entity) => {
+            DialogPage::PromptPinName(entity, ai_bypassed) => {
                 let entity = *entity;
+                let ai_bypassed = *ai_bypassed;
                 let pin_button = widget::button::suggested(fl!("pin-tab"))
                     .on_press(Message::PinNameConfirmed(entity, self.pin_name_value.clone()));
                 let cancel_button =
@@ -2689,8 +2691,27 @@ impl Application for App {
                     .on_input(Message::PinNameValueChanged)
                     .on_submit(move |_| Message::PinNameConfirmed(entity, pin_name.clone()));
 
-                // Build control with optional loading indicator
-                let control: Element<'_, Message> = if self.ai_suggesting {
+                // Build control with optional loading indicator or bypass message
+                // Only show bypass message if AI is configured (otherwise nothing to bypass)
+                let ai_configured = self.config.anthropic_api_key.is_some();
+                let control: Element<'_, Message> = if ai_bypassed && ai_configured {
+                    // Show text input with bypass message
+                    widget::column::with_children(vec![
+                        text_input.into(),
+                        widget::row::with_children(vec![
+                            icon::from_name("dialog-information-symbolic")
+                                .size(16)
+                                .into(),
+                            widget::text::body(fl!("ai-suggestion-bypassed"))
+                                .into(),
+                        ])
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into(),
+                    ])
+                    .spacing(8)
+                    .into()
+                } else if self.ai_suggesting {
                     // Show text input with loading indicator
                     widget::column::with_children(vec![
                         text_input.into(),
@@ -4364,7 +4385,7 @@ impl Application for App {
                 }
             }
             // Pinned tabs messages
-            Message::PromptPinName(entity) => {
+            Message::PromptPinName(entity, skip_ai) => {
                 // Reset AI suggestion state
                 self.ai_suggestion_received = false;
                 self.ai_suggesting = false;
@@ -4386,8 +4407,9 @@ impl Application for App {
                     (fl!("new-document"), String::new())
                 };
 
-                // Start with empty field if AI is available, otherwise use default name
-                let will_use_ai = self.config.anthropic_api_key.is_some()
+                // Start with empty field if AI is available and not bypassed, otherwise use default name
+                let will_use_ai = !skip_ai
+                    && self.config.anthropic_api_key.is_some()
                     && !content.is_empty()
                     && content.len() <= self.config.ai_max_content_size;
 
@@ -4398,9 +4420,10 @@ impl Application for App {
                     self.pin_name_value = default_name.clone();
                 }
 
-                self.dialog_page_opt = Some(DialogPage::PromptPinName(entity));
+                // Track if AI was bypassed (for display in dialog)
+                self.dialog_page_opt = Some(DialogPage::PromptPinName(entity, skip_ai));
 
-                // Start async AI suggestion if API key is configured
+                // Start async AI suggestion if API key is configured and not bypassed
                 let tasks = vec![widget::text_input::focus(self.pin_name_id.clone())];
                 if will_use_ai {
                     let api_key = self.config.anthropic_api_key.clone().unwrap();
@@ -4476,7 +4499,9 @@ impl Application for App {
                 self.ai_suggesting = false;
             }
             Message::TabPin(entity) => {
-                return self.update(Message::PromptPinName(entity));
+                // Check if Shift is held to bypass AI suggestion
+                let skip_ai = self.modifiers.contains(Modifiers::SHIFT);
+                return self.update(Message::PromptPinName(entity, skip_ai));
             }
             Message::TabUnpin(entity) => {
                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {

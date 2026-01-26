@@ -169,6 +169,7 @@ anthropic-api-key = Anthropic API Key
 anthropic-api-key-placeholder = Enter your API key...
 anthropic-api-key-description = Used for AI-powered filename suggestions when pinning notes
 ai-suggesting = Suggesting name...
+ai-suggestion-bypassed = AI Name Suggestion Bypassed
 
 # Markdown view
 view-mode = View Mode
