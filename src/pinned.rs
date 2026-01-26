@@ -209,6 +209,71 @@ pub fn is_in_pinned_dir(pinned_dir: &Path, file_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Move a file from the pinned notes directory to the Documents folder.
+///
+/// Returns the new path if successful.
+pub fn unpin_and_move_to_documents(file_path: &Path) -> Result<PathBuf, PinError> {
+    // Get the user's Documents directory
+    let documents_dir = dirs::document_dir().ok_or_else(|| {
+        PinError::DirectoryCreationFailed(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Documents directory not found",
+        ))
+    })?;
+
+    // Ensure Documents directory exists
+    if !documents_dir.exists() {
+        fs::create_dir_all(&documents_dir).map_err(PinError::DirectoryCreationFailed)?;
+    }
+
+    // Get the filename
+    let filename = file_path
+        .file_name()
+        .ok_or_else(|| PinError::InvalidFileName("No filename in path".to_string()))?;
+
+    // Build destination path
+    let mut dest_path = documents_dir.join(filename);
+
+    // Handle name collision by appending a number
+    if dest_path.exists() {
+        let stem = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = file_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("md");
+
+        let mut counter = 1;
+        loop {
+            let new_name = format!("{}-{}.{}", stem, counter, ext);
+            dest_path = documents_dir.join(&new_name);
+            if !dest_path.exists() {
+                break;
+            }
+            counter += 1;
+            if counter > 1000 {
+                return Err(PinError::FileAlreadyExists(dest_path));
+            }
+        }
+    }
+
+    // Move the file (rename if same filesystem, otherwise copy+delete)
+    if let Err(_) = fs::rename(file_path, &dest_path) {
+        // Cross-filesystem move: copy then delete
+        fs::copy(file_path, &dest_path).map_err(PinError::WriteFailed)?;
+        fs::remove_file(file_path).map_err(|e| {
+            log::warn!("Failed to remove original file after copy: {}", e);
+            // Don't fail the operation, file was successfully copied
+            PinError::WriteFailed(e)
+        })?;
+    }
+
+    log::info!("Unpinned and moved file to: {:?}", dest_path);
+    Ok(dest_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -476,6 +476,8 @@ pub enum Message {
     // Markdown view mode messages
     SetMarkdownViewMode(segmented_button::Entity, tab::MarkdownViewMode),
     ToggleMarkdownViewMode(segmented_button::Entity),
+    // Tab bar scroll
+    TabBarScroll(f32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -565,6 +567,8 @@ pub struct App {
     pinned_notes: Vec<pinned::PinnedNote>,
     /// State for tab bar context menu (entity and position for popover)
     tab_bar_context_menu: Option<(segmented_button::Entity, Point)>,
+    /// Scrollable ID for the tab bar
+    tab_bar_scrollable_id: widget::Id,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2213,6 +2217,7 @@ impl Application for App {
             show_pinned_sidebar: false,
             pinned_notes: Vec::new(),
             tab_bar_context_menu: None,
+            tab_bar_scrollable_id: widget::Id::unique(),
         };
 
         // Do not show nav bar by default. Will be opened by open_project if needed
@@ -4150,6 +4155,50 @@ impl Application for App {
                     return self.update(Message::TabActivate(entity));
                 }
             }
+            Message::TabBarScroll(delta) => {
+                // Scroll tabs without wrapping
+                // Scroll up (positive delta) = previous tab (left)
+                // Scroll down (negative delta) = next tab (right)
+                let len = self.tab_model.iter().count();
+                if len <= 1 {
+                    return Task::none();
+                }
+
+                let current_pos = self
+                    .tab_model
+                    .position(self.tab_model.active())
+                    .map(|i| i as usize)
+                    .unwrap_or(0);
+
+                let new_pos = if delta > 0.0 {
+                    // Scroll up = previous tab (left)
+                    current_pos.saturating_sub(1)
+                } else {
+                    // Scroll down = next tab (right)
+                    (current_pos + 1).min(len - 1)
+                };
+
+                if new_pos != current_pos {
+                    // Activate the new tab
+                    let entity_opt = self.tab_model.iter().nth(new_pos);
+                    if let Some(entity) = entity_opt {
+                        self.tab_model.activate(entity);
+
+                        // Scroll the tab bar to show the active tab
+                        // Estimate ~150 pixels per tab (average width)
+                        let estimated_tab_width = 150.0;
+                        let scroll_x = (new_pos as f32) * estimated_tab_width;
+
+                        // Use scroll_to to scroll the tab bar
+                        let scroll_task = iced::widget::scrollable::scroll_to(
+                            self.tab_bar_scrollable_id.clone(),
+                            iced::widget::scrollable::AbsoluteOffset { x: scroll_x, y: 0.0 },
+                        );
+
+                        return Task::batch([scroll_task, self.update_tab()]);
+                    }
+                }
+            }
             Message::TabSetCursor(entity, cursor) => {
                 if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
                     let mut editor = tab.editor.lock().unwrap();
@@ -4431,10 +4480,34 @@ impl Application for App {
             }
             Message::TabUnpin(entity) => {
                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    // If the file is in the pinned notes directory, move it to Documents
+                    if let Some(ref old_path) = tab.path_opt {
+                        if pinned::is_in_pinned_dir(&self.config.pinned_notes_dir, old_path) {
+                            match pinned::unpin_and_move_to_documents(old_path) {
+                                Ok(new_path) => {
+                                    log::info!(
+                                        "Unpinned and moved file from {:?} to {:?}",
+                                        old_path,
+                                        new_path
+                                    );
+                                    // Update the tab's path to the new location
+                                    tab.path_opt = Some(new_path);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to move unpinned file: {}", e);
+                                    // Continue with unpin even if move fails
+                                }
+                            }
+                        }
+                    }
+
                     tab.is_pinned = false;
                     // Update the title to remove pin icon
                     let title = tab.title();
                     self.tab_model.text_set(entity, title);
+
+                    // Refresh the pinned notes sidebar
+                    self.pinned_notes = pinned::scan_pinned_notes(&self.config.pinned_notes_dir);
                 }
             }
             // Pinned notes sidebar messages
@@ -4577,6 +4650,7 @@ impl Application for App {
             };
 
         // Build tab bar with context menu support
+        // Use Length::Shrink so each tab is sized to content, scrollable handles overflow
         let tab_bar = widget::tab_bar::horizontal(&self.tab_model)
             .button_height(32)
             .button_spacing(space_xxs)
@@ -4587,15 +4661,65 @@ impl Application for App {
             .on_context(|entity| Message::TabBarContextMenu(entity, Some(Point::ORIGIN)))
             .width(Length::Shrink);
 
-        let tab_bar_row = widget::row::with_capacity(2)
-            .align_y(Alignment::Center)
-            .push(tab_bar)
-            .push(
-                button::custom(icon_cache_get("list-add-symbolic", 16))
-                    .on_press(Message::NewFile)
-                    .padding(space_xxs)
-                    .class(style::Button::Icon),
-            );
+        // Wrap tab bar in mouse_area first to capture scroll events for tab switching
+        let tab_bar_with_mouse = widget::mouse_area(tab_bar).on_scroll(|delta| {
+            let y = match delta {
+                cosmic::iced::mouse::ScrollDelta::Lines { y, .. } => y,
+                cosmic::iced::mouse::ScrollDelta::Pixels { y, .. } => y / 20.0,
+            };
+            Message::TabBarScroll(y)
+        });
+
+        // Then wrap in horizontal scrollable for smooth view scrolling
+        let tab_bar_with_scroll = widget::scrollable(tab_bar_with_mouse)
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::new().width(0).scroller_width(0),
+            ))
+            .id(self.tab_bar_scrollable_id.clone())
+            .width(Length::Fill);
+
+        // Check if we need navigation buttons (more than one tab)
+        let tab_count = self.tab_model.iter().count();
+        let current_pos = self
+            .tab_model
+            .position(self.tab_model.active())
+            .map(|i| i as usize)
+            .unwrap_or(0);
+        let has_prev = current_pos > 0;
+        let has_next = current_pos < tab_count.saturating_sub(1);
+
+        // Build tab bar row with navigation buttons
+        let mut tab_bar_row = widget::row::with_capacity(4).align_y(Alignment::Center);
+
+        // Previous tab button (<)
+        let prev_button = button::custom(icon_cache_get("go-previous-symbolic", 16))
+            .padding(space_xxs)
+            .class(style::Button::Icon);
+        if has_prev {
+            tab_bar_row = tab_bar_row.push(prev_button.on_press(Message::TabBarScroll(1.0)));
+        } else {
+            tab_bar_row = tab_bar_row.push(prev_button);
+        }
+
+        tab_bar_row = tab_bar_row.push(tab_bar_with_scroll);
+
+        // Next tab button (>)
+        let next_button = button::custom(icon_cache_get("go-next-symbolic", 16))
+            .padding(space_xxs)
+            .class(style::Button::Icon);
+        if has_next {
+            tab_bar_row = tab_bar_row.push(next_button.on_press(Message::TabBarScroll(-1.0)));
+        } else {
+            tab_bar_row = tab_bar_row.push(next_button);
+        }
+
+        // New tab button (+)
+        tab_bar_row = tab_bar_row.push(
+            button::custom(icon_cache_get("list-add-symbolic", 16))
+                .on_press(Message::NewFile)
+                .padding(space_xxs)
+                .class(style::Button::Icon),
+        );
 
         tab_column = tab_column.push(tab_bar_row);
 
@@ -4645,22 +4769,42 @@ impl Application for App {
                     (true, tab::MarkdownViewMode::Rendered) => {
                         // Rendered-only view for markdown
                         let content = tab.text();
-                        tab_column = tab_column.push(markdown_view::markdown_view(&content));
+                        let rendered = markdown_view::markdown_view(&content);
+                        // Wrap in mouse_area to handle double-click -> switch to split view
+                        let rendered_with_click = widget::mouse_area(rendered)
+                            .on_double_click(Message::SetMarkdownViewMode(
+                                tab_id,
+                                tab::MarkdownViewMode::Split,
+                            ));
+                        tab_column = tab_column.push(rendered_with_click);
                     }
                     (true, tab::MarkdownViewMode::Split) => {
                         // Split view: editor on left, rendered on right
                         let content = tab.text();
                         let editor = build_editor();
                         let rendered = markdown_view::markdown_view(&content);
-                        let split_view = widget::row::with_capacity(2)
+
+                        // Wrap rendered: double-click -> Rendered mode
+                        // (Editor side doesn't get double-click handler because
+                        // text_box already uses double-click for word selection)
+                        let rendered_with_click = widget::mouse_area(
+                            widget::container(rendered).width(Length::FillPortion(1)),
+                        )
+                        .on_double_click(Message::SetMarkdownViewMode(
+                            tab_id,
+                            tab::MarkdownViewMode::Rendered,
+                        ));
+
+                        let split_view = widget::row::with_capacity(3)
                             .push(widget::container(editor).width(Length::FillPortion(1)))
                             .push(widget::divider::vertical::light())
-                            .push(widget::container(rendered).width(Length::FillPortion(1)))
+                            .push(rendered_with_click)
                             .spacing(4);
                         tab_column = tab_column.push(split_view);
                     }
                     _ => {
-                        // Raw mode (default) or non-markdown files
+                        // Raw mode or non-markdown files
+                        // (no double-click handler - text_box uses it for word selection)
                         tab_column = tab_column.push(build_editor());
                     }
                 }

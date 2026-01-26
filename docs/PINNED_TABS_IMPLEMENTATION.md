@@ -295,3 +295,88 @@ toml = "0.8"           # TOML parsing for AI config
 1. Create markdown with `**bold**` and `*italic*`
 2. Switch to Rendered or Split view
 3. Verify formatting displays correctly
+
+---
+
+## Double-Click View Mode Switching (January 2026)
+
+### Overview
+
+Double-clicking in rendered markdown areas allows quick transitions between view modes without using menus or keyboard shortcuts.
+
+### Behavior
+
+| Current Mode | Double-Click Location | Result |
+|-------------|----------------------|--------|
+| Rendered | Anywhere in content | Switch to Split |
+| Split | Rendered (right side) | Switch to Rendered |
+
+**Note:** Double-click in editor areas (Raw mode or Split left side) is reserved for text selection (word selection), so no view mode switching is available there.
+
+### Implementation
+
+In `src/main.rs`, rendered views are wrapped with `widget::mouse_area()`:
+
+```rust
+// Rendered mode -> Split
+let rendered_with_click = widget::mouse_area(rendered)
+    .on_double_click(Message::SetMarkdownViewMode(tab_id, MarkdownViewMode::Split));
+
+// Split mode: rendered side -> Rendered
+let rendered_with_click = widget::mouse_area(rendered)
+    .on_double_click(Message::SetMarkdownViewMode(tab_id, MarkdownViewMode::Rendered));
+```
+
+### User Experience
+
+1. **Rendered → Split**: Double-click to start editing while keeping preview
+2. **Split → Rendered**: Double-click preview side to focus on reading
+
+---
+
+## Unpin Moves File to Documents (January 2026)
+
+### Overview
+
+When unpinning a tab, if the file is in the pinned notes directory, it is automatically moved to the user's `~/Documents` folder. The tab stays open with its path updated to the new location.
+
+### Implementation
+
+**New function in `src/pinned.rs`:**
+
+```rust
+pub fn unpin_and_move_to_documents(file_path: &Path) -> Result<PathBuf, PinError>
+```
+
+This function:
+- Gets the user's Documents directory via `dirs::document_dir()`
+- Handles name collisions by appending a number (e.g., `file-1.md`)
+- Moves the file (using `fs::rename` or copy+delete for cross-filesystem moves)
+- Returns the new path
+
+**Updated `TabUnpin` handler in `src/main.rs`:**
+
+1. Checks if file is in pinned notes directory
+2. Moves file to Documents if it is
+3. Updates `tab.path_opt` to the new location
+4. Removes pin icon from title
+5. Refreshes pinned notes sidebar
+
+### User Experience
+
+1. Right-click a pinned tab → "Unpin Tab"
+2. File is moved from `~/Documents/cosmic-pinned-notes/` to `~/Documents/`
+3. Tab remains open, now pointing to new location
+4. Tab title no longer shows pin icon
+5. File is removed from pinned notes sidebar
+
+### Testing
+
+1. Pin a tab to create a file in the pinned notes directory
+2. Right-click the tab → Unpin Tab
+3. Verify:
+   - File now exists in `~/Documents/`
+   - File removed from `~/Documents/cosmic-pinned-notes/`
+   - Tab remains open
+   - Tab title no longer has pin icon
+   - Pinned notes sidebar no longer shows the file
