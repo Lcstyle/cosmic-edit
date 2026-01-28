@@ -1409,7 +1409,7 @@ dependencies = [
 [[package]]
 name = "cosmic-config"
 version = "1.0.0"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "atomicwrites",
  "cosmic-config-derive",
@@ -1430,7 +1430,7 @@ dependencies = [
 [[package]]
 name = "cosmic-config-derive"
 version = "1.0.0"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "quote",
  "syn 2.0.114",
@@ -1604,7 +1604,7 @@ dependencies = [
 [[package]]
 name = "cosmic-theme"
 version = "1.0.0"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "almost",
  "cosmic-config",
@@ -3383,7 +3383,7 @@ dependencies = [
 [[package]]
 name = "iced"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "dnd",
  "iced_accessibility",
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "iced_accessibility"
 version = "0.1.0"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -3410,7 +3410,7 @@ dependencies = [
 [[package]]
 name = "iced_core"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "bitflags 2.10.0",
  "bytes",
@@ -3434,7 +3434,7 @@ dependencies = [
 [[package]]
 name = "iced_futures"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "futures",
  "iced_core",
@@ -3460,7 +3460,7 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "bitflags 2.10.0",
  "bytemuck",
@@ -3482,7 +3482,7 @@ dependencies = [
 [[package]]
 name = "iced_renderer"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "iced_graphics",
  "iced_tiny_skia",
@@ -3494,7 +3494,7 @@ dependencies = [
 [[package]]
 name = "iced_runtime"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "bytes",
  "cosmic-client-toolkit",
@@ -3509,7 +3509,7 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -3525,7 +3525,7 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "as-raw-xcb-connection",
  "bitflags 2.10.0",
@@ -3556,7 +3556,7 @@ dependencies = [
 [[package]]
 name = "iced_widget"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "cosmic-client-toolkit",
  "dnd",
@@ -3575,7 +3575,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0-dev"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "cosmic-client-toolkit",
  "dnd",
@@ -4605,7 +4605,7 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 [[package]]
 name = "libcosmic"
 version = "1.0.0"
-source = "git+https://github.com/Lcstyle/libcosmic.git?branch=fix%2Fscroll-active-tab-visible#fc6fb30cb0451e26a1656678cb0ffd15dccd34c3"
+source = "git+https://github.com/Lcstyle/libcosmic.git?branch=feat%2Fexpand-active-tab#a1f6a74f206890317aaa2c6b9a0c90fecaff4451"
 dependencies = [
  "apply",
  "ashpd 0.12.1",
