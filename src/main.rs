@@ -977,7 +977,7 @@ impl App {
                     // Add tab with unsaved indicator
                     let mut title = tab.title();
                     if is_pinned {
-                        title = format!("\u{1F4CC} {}", title);
+                        title = format!("* {}", title);
                     }
                     title.push_str(" \u{2022}");
                     self.tab_model
@@ -997,7 +997,7 @@ impl App {
                     tab.is_pinned = is_pinned;
                     let mut title = tab.title();
                     if is_pinned {
-                        title = format!("\u{1F4CC} {}", title);
+                        title = format!("* {}", title);
                     }
                     self.tab_model
                         .insert()
@@ -4142,6 +4142,7 @@ impl Application for App {
                 }
             }
             Message::TabBarContextMenu(entity, position_opt) => {
+                log::debug!("TabBarContextMenu: entity={:?}, position={:?}", entity, position_opt);
                 self.tab_bar_context_menu = position_opt.map(|p| (entity, p));
             }
             Message::TabNext => {
@@ -4204,19 +4205,7 @@ impl Application for App {
                     let entity_opt = self.tab_model.iter().nth(new_pos);
                     if let Some(entity) = entity_opt {
                         self.tab_model.activate(entity);
-
-                        // Scroll the tab bar to show the active tab
-                        // Estimate ~150 pixels per tab (average width)
-                        let estimated_tab_width = 150.0;
-                        let scroll_x = (new_pos as f32) * estimated_tab_width;
-
-                        // Use scroll_to to scroll the tab bar
-                        let scroll_task = iced::widget::scrollable::scroll_to(
-                            self.tab_bar_scrollable_id.clone(),
-                            iced::widget::scrollable::AbsoluteOffset { x: scroll_x, y: 0.0 },
-                        );
-
-                        return Task::batch([scroll_task, self.update_tab()]);
+                        return self.update_tab();
                     }
                 }
             }
@@ -4470,7 +4459,7 @@ impl Application for App {
                             tab.path_opt = Some(path);
                             tab.is_pinned = true;
                             let _ = tab.save();
-                            let title = format!("\u{1F4CC} {}", tab.title());
+                            let title = format!("* {}", tab.title());
                             let icon = tab.icon(16);
                             (title, icon)
                         } else {
@@ -4565,7 +4554,7 @@ impl Application for App {
                         tab.markdown_view_mode = self.config.default_markdown_view_mode.into();
                     }
                     tab.is_pinned = true;
-                    let title = format!("\u{1F4CC} {}", tab.title());
+                    let title = format!("* {}", tab.title());
 
                     self.tab_model
                         .insert()
@@ -4674,77 +4663,32 @@ impl Application for App {
                 Some(vec![])
             };
 
-        // Build tab bar with context menu support
-        // Use Length::Shrink so each tab is sized to content, scrollable handles overflow
+        // Build tab bar with context menu support and scroll-to-switch
+        // scrollable_focus(true) enables mouse wheel scrolling to switch tabs
+        // minimum_button_width prevents tabs from getting too compressed
         let tab_bar = widget::tab_bar::horizontal(&self.tab_model)
             .button_height(32)
             .button_spacing(space_xxs)
+            .minimum_button_width(100)
             .close_icon(icon_cache_get("window-close-symbolic", 16))
             .on_activate(Message::TabActivate)
             .on_close(Message::TabClose)
             .context_menu(tab_bar_context_menu_items)
             .on_context(|entity| Message::TabBarContextMenu(entity, Some(Point::ORIGIN)))
-            .width(Length::Shrink);
-
-        // Wrap tab bar in mouse_area first to capture scroll events for tab switching
-        let tab_bar_with_mouse = widget::mouse_area(tab_bar).on_scroll(|delta| {
-            let y = match delta {
-                cosmic::iced::mouse::ScrollDelta::Lines { y, .. } => y,
-                cosmic::iced::mouse::ScrollDelta::Pixels { y, .. } => y / 20.0,
-            };
-            Message::TabBarScroll(y)
-        });
-
-        // Then wrap in horizontal scrollable for smooth view scrolling
-        let tab_bar_with_scroll = widget::scrollable(tab_bar_with_mouse)
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                iced::widget::scrollable::Scrollbar::new().width(0).scroller_width(0),
-            ))
-            .id(self.tab_bar_scrollable_id.clone())
+            .scrollable_focus(true)
             .width(Length::Fill);
 
-        // Check if we need navigation buttons (more than one tab)
-        let tab_count = self.tab_model.iter().count();
-        let current_pos = self
-            .tab_model
-            .position(self.tab_model.active())
-            .map(|i| i as usize)
-            .unwrap_or(0);
-        let has_prev = current_pos > 0;
-        let has_next = current_pos < tab_count.saturating_sub(1);
-
-        // Build tab bar row with navigation buttons
-        let mut tab_bar_row = widget::row::with_capacity(4).align_y(Alignment::Center);
-
-        // Previous tab button (<)
-        let prev_button = button::custom(icon_cache_get("go-previous-symbolic", 16))
-            .padding(space_xxs)
-            .class(style::Button::Icon);
-        if has_prev {
-            tab_bar_row = tab_bar_row.push(prev_button.on_press(Message::TabBarScroll(1.0)));
-        } else {
-            tab_bar_row = tab_bar_row.push(prev_button);
-        }
-
-        tab_bar_row = tab_bar_row.push(tab_bar_with_scroll);
-
-        // Next tab button (>)
-        let next_button = button::custom(icon_cache_get("go-next-symbolic", 16))
-            .padding(space_xxs)
-            .class(style::Button::Icon);
-        if has_next {
-            tab_bar_row = tab_bar_row.push(next_button.on_press(Message::TabBarScroll(-1.0)));
-        } else {
-            tab_bar_row = tab_bar_row.push(next_button);
-        }
-
-        // New tab button (+)
-        tab_bar_row = tab_bar_row.push(
-            button::custom(icon_cache_get("list-add-symbolic", 16))
-                .on_press(Message::NewFile)
-                .padding(space_xxs)
-                .class(style::Button::Icon),
-        );
+        // Build tab bar row with new tab button
+        // The tab_bar widget has built-in < > overflow arrows
+        let tab_bar_row = widget::row::with_capacity(2)
+            .align_y(Alignment::Center)
+            .push(tab_bar)
+            .push(
+                button::custom(icon_cache_get("list-add-symbolic", 16))
+                    .on_press(Message::NewFile)
+                    .padding(space_xxs)
+                    .class(style::Button::Icon),
+            );
 
         tab_column = tab_column.push(tab_bar_row);
 

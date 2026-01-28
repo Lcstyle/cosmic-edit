@@ -80,7 +80,6 @@ onig_sys = { git = "https://github.com/rust-onig/rust-onig.git", branch = "main"
 [patch.'https://github.com/pop-os/cosmic-text.git']
 cosmic-text = { git = "https://github.com/Lcstyle/cosmic-text.git", branch = "feature/rope-buffer" }
 
-# [patch.'https://github.com/pop-os/libcosmic']
-# libcosmic = { path = "../libcosmic" }
-# cosmic-config = { path = "../libcosmic/cosmic-config" }
-# cosmic-theme = { path = "../libcosmic/cosmic-theme" }
+# Patch libcosmic to use fork with scroll-to-active fix
+[patch.'https://github.com/pop-os/libcosmic.git']
+libcosmic = { git = "https://github.com/Lcstyle/libcosmic.git", branch = "fix/scroll-active-tab-visible" }
