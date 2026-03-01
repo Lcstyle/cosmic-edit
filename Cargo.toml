@@ -80,6 +80,6 @@ onig_sys = { git = "https://github.com/rust-onig/rust-onig.git", branch = "main"
 [patch.'https://github.com/pop-os/cosmic-text.git']
 cosmic-text = { git = "https://github.com/Lcstyle/cosmic-text.git", branch = "feature/rope-buffer" }
 
-# Patch libcosmic to use fork with scroll-to-active + expand-active-tab
+# Patch libcosmic to use fork with scroll-to-active, expand-active-tab, tooltips
 [patch.'https://github.com/pop-os/libcosmic.git']
 libcosmic = { git = "https://github.com/Lcstyle/libcosmic.git", branch = "feat/expand-active-tab" }

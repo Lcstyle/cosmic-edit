@@ -153,6 +153,17 @@ impl Tab {
             Self::GitDiff(tab) => tab.title.clone(),
         }
     }
+
+    pub fn tooltip_path(&self) -> String {
+        match self {
+            Self::Editor(tab) => tab
+                .path_opt
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| self.title()),
+            Self::GitDiff(tab) => tab.diff.path.display().to_string(),
+        }
+    }
 }
 
 pub struct GitDiffTab {

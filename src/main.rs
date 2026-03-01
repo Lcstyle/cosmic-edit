@@ -980,9 +980,15 @@ impl App {
                         title = format!("* {}", title);
                     }
                     title.push_str(" \u{2022}");
+                    let tooltip = tab
+                        .path_opt
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| tab.title());
                     self.tab_model
                         .insert()
                         .text(title)
+                        .tooltip(tooltip)
                         .icon(tab.icon(16))
                         .data::<Tab>(Tab::Editor(tab))
                         .closable()
@@ -999,9 +1005,15 @@ impl App {
                     if is_pinned {
                         title = format!("* {}", title);
                     }
+                    let tooltip = tab
+                        .path_opt
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| tab.title());
                     self.tab_model
                         .insert()
                         .text(title)
+                        .tooltip(tooltip)
                         .icon(tab.icon(16))
                         .data::<Tab>(Tab::Editor(tab))
                         .closable()
@@ -1245,10 +1257,16 @@ impl App {
         match self.new_tab(path_opt)? {
             NewTab::Exists(entity) => Some(entity),
             NewTab::Tab(tab) => {
+                let tooltip = tab
+                    .path_opt
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| tab.title());
                 let entity = self
                     .tab_model
                     .insert()
                     .text(tab.title())
+                    .tooltip(tooltip)
                     .icon(tab.icon(16))
                     .data::<Tab>(Tab::Editor(tab))
                     .closable()
@@ -1275,7 +1293,13 @@ impl App {
             }
             NewTab::Tab(tab) => {
                 // Replace existing tab in place
+                let tooltip = tab
+                    .path_opt
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| tab.title());
                 self.tab_model.text_set(entity, tab.title());
+                self.tab_model.tooltip_set(entity, tooltip);
                 self.tab_model.icon_set(entity, tab.icon(16));
                 self.tab_model.data_set::<Tab>(entity, Tab::Editor(tab));
                 self.tab_model.activate(entity);
@@ -3553,9 +3577,11 @@ impl Application for App {
                 let icon =
                     icon::icon(mime_icon(mime_for_path(&diff.path, None, false), 16)).size(16);
                 let tab = Tab::GitDiff(GitDiffTab { title, diff });
+                let tooltip = tab.tooltip_path();
                 self.tab_model
                     .insert()
                     .text(tab.title())
+                    .tooltip(tooltip)
                     .icon(icon)
                     .data::<Tab>(tab)
                     .closable()
@@ -3933,23 +3959,32 @@ impl Application for App {
                         }
 
                         // Save to the new path
-                        let (title_opt, backup_id) = {
+                        let (title_opt, tooltip_opt, backup_id) = {
                             if let Some(Tab::Editor(tab)) =
                                 self.tab_model.data_mut::<Tab>(entity)
                             {
                                 match tab.save_as(picked) {
-                                    Ok(()) => (Some(tab.title()), tab.backup_id.take()),
+                                    Ok(()) => {
+                                        let tooltip = tab
+                                            .path_opt
+                                            .as_ref()
+                                            .map(|p| p.display().to_string());
+                                        (Some(tab.title()), tooltip, tab.backup_id.take())
+                                    }
                                     Err(e) => {
                                         log::error!("Save As failed: {}", e);
-                                        (Some(tab.title()), None)
+                                        (Some(tab.title()), None, None)
                                     }
                                 }
                             } else {
-                                (None, None)
+                                (None, None, None)
                             }
                         };
                         if let Some(title) = title_opt {
                             self.tab_model.text_set(entity, title);
+                        }
+                        if let Some(tooltip) = tooltip_opt {
+                            self.tab_model.tooltip_set(entity, tooltip);
                         }
                         hotexit::cleanup_backup_after_save(backup_id);
                         return self.update_dialogs();
@@ -4455,18 +4490,24 @@ impl Application for App {
                     Ok(path) => {
                         // Update the tab to point to the new file and mark as pinned
                         // First, update the tab data
-                        let (title, icon) = if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                        let (title, icon, tooltip) = if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
                             tab.path_opt = Some(path);
                             tab.is_pinned = true;
                             let _ = tab.save();
                             let title = format!("* {}", tab.title());
                             let icon = tab.icon(16);
-                            (title, icon)
+                            let tooltip = tab
+                                .path_opt
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| tab.title());
+                            (title, icon, tooltip)
                         } else {
                             return Task::none();
                         };
                         // Then update the tab bar (outside the borrow)
                         self.tab_model.text_set(entity, title);
+                        self.tab_model.tooltip_set(entity, tooltip);
                         self.tab_model.icon_set(entity, icon);
                         self.update_watcher();
                         log::info!("Tab pinned successfully");
@@ -4518,7 +4559,13 @@ impl Application for App {
                     tab.is_pinned = false;
                     // Update the title to remove pin icon
                     let title = tab.title();
+                    let tooltip = tab
+                        .path_opt
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| tab.title());
                     self.tab_model.text_set(entity, title);
+                    self.tab_model.tooltip_set(entity, tooltip);
 
                     // Refresh the pinned notes sidebar
                     self.pinned_notes = pinned::scan_pinned_notes(&self.config.pinned_notes_dir);
@@ -4555,10 +4602,16 @@ impl Application for App {
                     }
                     tab.is_pinned = true;
                     let title = format!("* {}", tab.title());
+                    let tooltip = tab
+                        .path_opt
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| tab.title());
 
                     self.tab_model
                         .insert()
                         .text(title)
+                        .tooltip(tooltip)
                         .icon(tab.icon(16))
                         .data::<Tab>(Tab::Editor(tab))
                         .closable()
@@ -4675,6 +4728,7 @@ impl Application for App {
             .on_close(Message::TabClose)
             .context_menu(tab_bar_context_menu_items)
             .on_context(|entity| Message::TabBarContextMenu(entity, Some(Point::ORIGIN)))
+            .on_empty_double_click(|| Message::NewFile)
             .scrollable_focus(true)
             .width(Length::Fill);
 

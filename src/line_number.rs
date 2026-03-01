@@ -42,6 +42,7 @@ impl LineNumberCache {
                     1.0, /* font size adjusted later */
                     None,
                     Wrap::None,
+                    cosmic_text::Ellipsize::None,
                     None,
                     8, /* default tab width */
                     Default::default(),
