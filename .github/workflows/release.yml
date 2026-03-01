@@ -72,7 +72,8 @@ jobs:
             mesa-libEGL-devel \
             dbus-devel \
             systemd-devel \
-            oniguruma-devel
+            oniguruma-devel \
+            openssl-devel
 
       - uses: actions/checkout@v5
 
