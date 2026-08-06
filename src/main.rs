@@ -43,6 +43,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use config::{AppTheme, CONFIG_VERSION, Config, ConfigState};
 mod config;
 
+mod json_scan;
 use git::{GitDiff, GitDiffLine, GitRepository, GitStatus, GitStatusKind};
 mod git;
 
