@@ -186,6 +186,7 @@ pub fn menu_bar<'a>(
     config_state: &ConfigState,
     key_binds: &HashMap<KeyBind, Action>,
     projects: &Vec<(String, PathBuf)>,
+    json_fold_active: bool,
 ) -> Element<'a, Message> {
     //TODO: port to libcosmic
     let menu_tab_width = |tab_width: u16| {
@@ -225,6 +226,86 @@ pub fn menu_bar<'a>(
             Action::CloseProject(project_i),
         ));
     }
+
+    let mut view_menu = vec![
+        MenuItem::Folder(
+            fl!("indentation"),
+            vec![
+                MenuItem::CheckBox(
+                    fl!("automatic-indentation"),
+                    None,
+                    config.auto_indent,
+                    Action::ToggleAutoIndent,
+                ),
+                MenuItem::Divider,
+                menu_tab_width(1),
+                menu_tab_width(2),
+                menu_tab_width(3),
+                menu_tab_width(4),
+                menu_tab_width(5),
+                menu_tab_width(6),
+                menu_tab_width(7),
+                menu_tab_width(8),
+                //TODO MenuItem::Divider,
+                //TODO MenuItem::Button(fl!("convert-indentation-to-spaces"), Action::Todo),
+                //TODO MenuItem::Button(fl!("convert-indentation-to-tabs"), Action::Todo),
+            ],
+        ),
+        MenuItem::Divider,
+        MenuItem::Button(fl!("zoom-in"), None, Action::ZoomIn),
+        MenuItem::Button(fl!("default-size"), None, Action::ZoomReset),
+        MenuItem::Button(fl!("zoom-out"), None, Action::ZoomOut),
+        MenuItem::Divider,
+        MenuItem::CheckBox(
+            fl!("word-wrap"),
+            None,
+            config.word_wrap,
+            Action::ToggleWordWrap,
+        ),
+        MenuItem::CheckBox(
+            fl!("show-line-numbers"),
+            None,
+            config.line_numbers,
+            Action::ToggleLineNumbers,
+        ),
+        MenuItem::CheckBox(
+            fl!("highlight-current-line"),
+            None,
+            config.highlight_current_line,
+            Action::ToggleHighlightCurrentLine,
+        ),
+        //TODO: MenuItem::CheckBox(fl!("syntax-highlighting"), Action::Todo),
+    ];
+    // Fold commands, only while the active tab is a foldable JSON document
+    // (Full-backed, at least one fold range).
+    if json_fold_active {
+        view_menu.push(MenuItem::Divider);
+        view_menu.push(MenuItem::Button(
+            fl!("json-fold-all"),
+            None,
+            Action::JsonFoldAll,
+        ));
+        view_menu.push(MenuItem::Button(
+            fl!("json-unfold-all"),
+            None,
+            Action::JsonUnfoldAll,
+        ));
+        for level in 1..=3u32 {
+            view_menu.push(MenuItem::Button(
+                fl!("json-fold-level", level = level),
+                None,
+                Action::JsonFoldLevel(level),
+            ));
+        }
+    }
+    view_menu.extend([
+        MenuItem::Divider,
+        MenuItem::Button(fl!("menu-settings"), None, Action::ToggleSettingsPage),
+        //TODO MenuItem::Divider,
+        //TODO MenuItem::Button(fl!("menu-keyboard-shortcuts"), Action::Todo),
+        MenuItem::Divider,
+        MenuItem::Button(fl!("menu-about"), None, Action::About),
+    ]);
 
     responsive_menu_bar()
         .item_height(ItemHeight::Dynamic(40))
@@ -292,64 +373,7 @@ pub fn menu_bar<'a>(
                         */
                     ],
                 ),
-                (
-                    (fl!("view")),
-                    vec![
-                        MenuItem::Folder(
-                            fl!("indentation"),
-                            vec![
-                                MenuItem::CheckBox(
-                                    fl!("automatic-indentation"),
-                                    None,
-                                    config.auto_indent,
-                                    Action::ToggleAutoIndent,
-                                ),
-                                MenuItem::Divider,
-                                menu_tab_width(1),
-                                menu_tab_width(2),
-                                menu_tab_width(3),
-                                menu_tab_width(4),
-                                menu_tab_width(5),
-                                menu_tab_width(6),
-                                menu_tab_width(7),
-                                menu_tab_width(8),
-                                //TODO MenuItem::Divider,
-                                //TODO MenuItem::Button(fl!("convert-indentation-to-spaces"), Action::Todo),
-                                //TODO MenuItem::Button(fl!("convert-indentation-to-tabs"), Action::Todo),
-                            ],
-                        ),
-                        MenuItem::Divider,
-                        MenuItem::Button(fl!("zoom-in"), None, Action::ZoomIn),
-                        MenuItem::Button(fl!("default-size"), None, Action::ZoomReset),
-                        MenuItem::Button(fl!("zoom-out"), None, Action::ZoomOut),
-                        MenuItem::Divider,
-                        MenuItem::CheckBox(
-                            fl!("word-wrap"),
-                            None,
-                            config.word_wrap,
-                            Action::ToggleWordWrap,
-                        ),
-                        MenuItem::CheckBox(
-                            fl!("show-line-numbers"),
-                            None,
-                            config.line_numbers,
-                            Action::ToggleLineNumbers,
-                        ),
-                        MenuItem::CheckBox(
-                            fl!("highlight-current-line"),
-                            None,
-                            config.highlight_current_line,
-                            Action::ToggleHighlightCurrentLine,
-                        ),
-                        //TODO: MenuItem::CheckBox(fl!("syntax-highlighting"), Action::Todo),
-                        MenuItem::Divider,
-                        MenuItem::Button(fl!("menu-settings"), None, Action::ToggleSettingsPage),
-                        //TODO MenuItem::Divider,
-                        //TODO MenuItem::Button(fl!("menu-keyboard-shortcuts"), Action::Todo),
-                        MenuItem::Divider,
-                        MenuItem::Button(fl!("menu-about"), None, Action::About),
-                    ],
-                ),
+                ((fl!("view")), view_menu),
             ],
         )
 }

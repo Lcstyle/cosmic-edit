@@ -4,14 +4,14 @@ use cosmic::{
     Renderer,
     cosmic_theme::palette::{WithAlpha, blend::Compose},
     iced::core::{
-        Border, Radians, Shell, Transformation,
+        Border, Radians, Shell, Transformation, alignment,
         clipboard::Clipboard,
         image,
         input_method::{Event as InputMethodEvent, InputMethod, Preedit, Purpose},
         keyboard::{Key, key::Named},
         layout::{self, Layout},
         renderer::{self, Quad, Renderer as _},
-        text::Renderer as _,
+        text::{self, Renderer as _},
         widget::{
             self, Id, Widget,
             operation::{self, Operation},
@@ -20,7 +20,7 @@ use cosmic::{
         window::Event as WindowEvent,
     },
     iced::{
-        Color, Element, Length, Padding, Point, Rectangle, Size, Vector,
+        Color, Element, Font, Length, Padding, Pixels, Point, Rectangle, Size, Vector,
         advanced::graphics::text::{Raw, font_system},
         event::Event,
         keyboard::{Event as KeyEvent, Modifiers},
@@ -41,6 +41,117 @@ use std::{
 
 use crate::{LINE_NUMBER_CACHE, SWASH_CACHE, line_number::LineNumberKey};
 
+/// Real line numbers under display-chunking: an over-long line is split
+/// into chunks joined by `LineEnding::None`, so a buffer row is a
+/// CONTINUATION iff the previous row's ending is None. Continuations belong
+/// to the previous real line; real lines get their true document number. A
+/// trailing no-newline line also has ending None but no follower, so `any`
+/// only trips on genuine chunk joins. Chunked documents are inherently
+/// small (32K chunks), so the scan is gated and ordinary files skip
+/// straight to identity numbering (`None`).
+struct ChunkLineMap {
+    continuation: Vec<bool>,
+    real: Vec<u32>,
+    max_real: u32,
+}
+
+fn chunk_line_map(buffer: &cosmic_text::Buffer) -> Option<ChunkLineMap> {
+    let count = buffer.line_count();
+    if count == 0 || count > 50_000 {
+        return None;
+    }
+    let mut continuation = Vec::with_capacity(count);
+    let mut real = Vec::with_capacity(count);
+    let mut any = false;
+    let mut n: u32 = 0;
+    let mut prev_ending_none = false;
+    for i in 0..count {
+        let is_cont = prev_ending_none;
+        if is_cont {
+            any = true;
+        } else {
+            n += 1;
+        }
+        continuation.push(is_cont);
+        real.push(n);
+        prev_ending_none = buffer.line_ending(i) == Some(cosmic_text::LineEnding::None);
+    }
+    if any {
+        Some(ChunkLineMap {
+            continuation,
+            real,
+            max_real: n,
+        })
+    } else {
+        None
+    }
+}
+
+impl ChunkLineMap {
+    /// Parsed-text line of a buffer row for fold lookups, `None` on chunk
+    /// continuations (their gutter is blank — no arrow, no click target).
+    fn parsed_line(map: Option<&Self>, row: usize) -> Option<u32> {
+        match map {
+            Some(map) => {
+                if map.continuation.get(row).copied().unwrap_or(true) {
+                    None
+                } else {
+                    map.real.get(row).map(|real| real.saturating_sub(1))
+                }
+            }
+            None => u32::try_from(row).ok(),
+        }
+    }
+
+    /// Number of real (parsed-text) lines the buffer holds under this map.
+    fn real_line_count(map: Option<&Self>, buffer: &cosmic_text::Buffer) -> usize {
+        match map {
+            Some(map) => map.max_real as usize,
+            None => buffer.line_count(),
+        }
+    }
+}
+
+/// Fold gutter data for one draw pass, in *parsed-text* line space (the
+/// space `json_scan::fold_ranges` reports). `ChunkLineMap` translates
+/// buffer rows to parsed lines; when the buffer's real-line structure
+/// disagrees with `parsed_lines` (mid-edit staleness before the debounced
+/// re-parse, or a chunked document past the map's 50K gate) the arrows and
+/// their click targets are suppressed rather than drawn on wrong rows.
+pub struct FoldGutter {
+    /// Fold-range start lines -> currently folded?
+    pub markers: std::collections::HashMap<u32, bool>,
+    /// Line count of the parsed text the markers were computed from.
+    pub parsed_lines: usize,
+}
+
+/// Number of visible (not hidden) buffer lines before line `i`: the
+/// scrollbar's position numerator while folds hide lines. Identity when
+/// nothing is hidden.
+fn visible_lines_before(buffer: &cosmic_text::Buffer, line_i: usize) -> usize {
+    (0..line_i.min(buffer.line_count()))
+        .filter(|i| !buffer.line_hidden(*i))
+        .count()
+}
+
+/// Absolute index of the `n`th visible buffer line (clamping to the last
+/// visible line): the inverse mapping for scrollbar clicks and drags.
+fn nth_visible_line(buffer: &cosmic_text::Buffer, n: usize) -> usize {
+    let count = buffer.line_count();
+    let mut seen = 0usize;
+    let mut last_visible = 0usize;
+    for i in 0..count {
+        if !buffer.line_hidden(i) {
+            last_visible = i;
+            if seen == n {
+                return i;
+            }
+            seen += 1;
+        }
+    }
+    last_visible
+}
+
 pub struct TextBox<'a, Message> {
     editor: &'a Mutex<ViEditor<'static, 'static>>,
     metrics: Metrics,
@@ -55,6 +166,8 @@ pub struct TextBox<'a, Message> {
     on_context_menu: Option<Box<dyn Fn(Option<Point>) -> Message + 'a>>,
     highlight_current_line: bool,
     line_numbers: bool,
+    fold_gutter: Option<FoldGutter>,
+    on_fold_toggle: Option<Box<dyn Fn(u32) -> Message + 'a>>,
 }
 
 impl<'a, Message> TextBox<'a, Message>
@@ -76,6 +189,8 @@ where
             on_context_menu: None,
             highlight_current_line: false,
             line_numbers: false,
+            fold_gutter: None,
+            on_fold_toggle: None,
         }
     }
 
@@ -133,6 +248,26 @@ where
 
     pub fn line_numbers(mut self) -> Self {
         self.line_numbers = true;
+        self
+    }
+
+    /// Show fold arrows in the gutter (▾ open / ▸ folded, left of the line
+    /// numbers) for the given fold-range start lines, and report gutter
+    /// clicks on those lines through `on_toggle`. Lines are in parsed-text
+    /// space; the widget translates through its chunk-aware gutter map.
+    /// Requires [`TextBox::line_numbers`] — without a gutter there is
+    /// nowhere to draw.
+    pub fn fold_gutter(
+        mut self,
+        markers: std::collections::HashMap<u32, bool>,
+        parsed_lines: usize,
+        on_toggle: impl Fn(u32) -> Message + 'a,
+    ) -> Self {
+        self.fold_gutter = Some(FoldGutter {
+            markers,
+            parsed_lines,
+        });
+        self.on_fold_toggle = Some(Box::new(on_toggle));
         self
     }
 
@@ -330,7 +465,7 @@ where
 
         editor.with_buffer(|buffer| {
             let mut layout_lines = 0;
-            for line in buffer.lines.iter() {
+            for line in buffer.lines_iter() {
                 match line.layout_opt() {
                     Some(layout) => layout_lines += layout.len(),
                     None => (),
@@ -452,11 +587,25 @@ where
         // Lock font system (used throughout)
         let mut font_system = font_system().write().unwrap();
 
+        // Chunk-aware gutter map (None for ordinary files); shared by the
+        // fold arrows and their click-target translation.
+        let chunk_map: Option<ChunkLineMap> = editor.with_buffer(chunk_line_map);
+
+        // Fold arrows extend the gutter with a band to the LEFT of the
+        // numbers; reserve it whenever the tab has fold data (per-tab
+        // stable, so the text does not jiggle during the brief mid-edit
+        // window when stale markers are suppressed).
+        let fold_band = if self.fold_gutter.is_some() && self.line_numbers {
+            metrics.font_size.ceil() as i32 + 4
+        } else {
+            0
+        };
+
         // Calculate line number information
         let (line_number_chars, editor_offset_x) = if self.line_numbers {
             // Calculate number of characters needed in line number
+            let mut line_count = editor.with_buffer(|buffer| buffer.line_count());
             let mut line_number_chars = 1;
-            let mut line_count = editor.with_buffer(|buffer| buffer.lines.len());
             while line_count >= 10 {
                 line_count /= 10;
                 line_number_chars += 1;
@@ -483,7 +632,10 @@ where
                 }
             }
 
-            (line_number_chars, (line_number_width + 8.0).ceil() as i32)
+            (
+                line_number_chars,
+                fold_band + (line_number_width + 8.0).ceil() as i32,
+            )
         } else {
             (0, 0)
         };
@@ -505,6 +657,35 @@ where
 
         // Shape and layout as needed
         editor.shape_as_needed(font_system.raw(), true);
+
+        // Fold rows visible in this frame: (line_top, line_w, folded), one
+        // per fold-range start line, first visual row only. Computed every
+        // draw (the arrows and the fold "…" render as live text on top of
+        // the cached gutter image). Suppressed entirely when the buffer's
+        // real-line structure disagrees with the parsed text the markers
+        // came from.
+        let fold_rows: Vec<(f32, f32, bool)> = match &self.fold_gutter {
+            Some(fold) if self.line_numbers => editor.with_buffer(|buffer| {
+                if ChunkLineMap::real_line_count(chunk_map.as_ref(), buffer) != fold.parsed_lines {
+                    return Vec::new();
+                }
+                let mut rows = Vec::new();
+                let mut last_line = usize::MAX;
+                for run in buffer.layout_runs() {
+                    if run.line_i == last_line {
+                        continue; // wrapped rows: arrow on the first only
+                    }
+                    last_line = run.line_i;
+                    if let Some(parsed) = ChunkLineMap::parsed_line(chunk_map.as_ref(), run.line_i)
+                        && let Some(folded) = fold.markers.get(&parsed)
+                    {
+                        rows.push((run.line_top, run.line_w, *folded));
+                    }
+                }
+                rows
+            }),
+            _ => Vec::new(),
+        };
 
         let mut handle_opt = state.handle_opt.lock().unwrap();
         let image_canvas = Canvas {
@@ -589,8 +770,9 @@ where
                                 let line_y = run.line_top + centering_offset + max_ascent;
 
                                 for layout_glyph in layout_line.glyphs.iter() {
-                                    let physical_glyph =
-                                        layout_glyph.physical((0., line_y), metrics.font_size);
+                                    // Numbers sit to the right of the fold band.
+                                    let physical_glyph = layout_glyph
+                                        .physical((fold_band as f32, line_y), metrics.font_size);
 
                                     swash_cache.with_pixels(
                                         font_system.raw(),
@@ -633,11 +815,25 @@ where
                     }
 
                     let start_line = start_line_opt.unwrap_or(end_line);
-                    let lines = buffer.lines.len();
-                    let start_y = (start_line * image_h as usize) / lines;
-                    let end_y = ((end_line + 1) * image_h as usize) / lines;
+                    // Scroll geometry runs in VISIBLE line units when the
+                    // tab can fold: folded-away (hidden) lines take no
+                    // track space, so the denominator is visible_line_count
+                    // and positions count only visible lines. Without fold
+                    // data (every non-JSON tab) this is exactly the plain
+                    // line math with zero extra scans.
+                    let (lines, start_index, end_index) = if self.fold_gutter.is_some() {
+                        (
+                            buffer.visible_line_count().max(1),
+                            visible_lines_before(buffer, start_line),
+                            visible_lines_before(buffer, end_line),
+                        )
+                    } else {
+                        (buffer.line_count(), start_line, end_line)
+                    };
+                    let start_y = (start_index * image_h as usize) / lines;
+                    let end_y = ((end_index + 1) * image_h as usize) / lines;
 
-                    let original_condition = start_line > 0 || (end_line + 1) < lines;
+                    let original_condition = start_index > 0 || (end_index + 1) < lines;
                     let visible_runs = (((image_h as f32 / scale_factor) / metrics.line_height)
                         .floor() as usize)
                         .max(1);
@@ -693,6 +889,44 @@ where
         // Draw cached image
         let image_position = layout.position() + [self.padding.left, self.padding.top].into();
 
+        // Colors for the fold arrows (gutter foreground) and the folded
+        // "…" (editor foreground, dimmed). Only resolved when fold rows
+        // are actually on screen.
+        let (fold_arrow_color, fold_ellipsis_color) = if fold_rows.is_empty() {
+            (Color::TRANSPARENT, Color::TRANSPARENT)
+        } else {
+            let arrow = {
+                let convert = |color: syntect::highlighting::Color| {
+                    Color::from_rgba8(color.r, color.g, color.b, (color.a as f32) / 255.0)
+                };
+                let fallback = editor.foreground_color();
+                editor.theme().settings.gutter_foreground.map_or(
+                    Color::from_rgba8(
+                        fallback.r(),
+                        fallback.g(),
+                        fallback.b(),
+                        (fallback.a() as f32) / 255.0,
+                    ),
+                    convert,
+                )
+            };
+            let fg = editor.foreground_color();
+            let ellipsis = Color::from_rgba8(fg.r(), fg.g(), fg.b(), (fg.a() as f32) / 255.0 * 0.5);
+            (arrow, ellipsis)
+        };
+        let fold_text = |content: &str| text::Text {
+            content: content.to_string(),
+            bounds: Size::INFINITE,
+            size: Pixels(metrics.font_size),
+            line_height: text::LineHeight::Absolute(Pixels(metrics.line_height)),
+            font: Font::MONOSPACE,
+            align_x: text::Alignment::Center,
+            align_y: alignment::Vertical::Center,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::None,
+            ellipsize: text::Ellipsize::None,
+        };
+
         // Draw editor UI
         renderer.with_translation(Vector::new(view_position.x, view_position.y), |renderer| {
             renderer.with_transformation(Transformation::scale(1.0 / scale_factor), |renderer| {
@@ -719,6 +953,28 @@ where
                             Size::new(image_size.width as f32, image_size.height as f32),
                         ),
                     );
+                }
+
+                // Fold arrows in the gutter band, left of the numbers:
+                // ▾ on an open range start, ▸ on a folded one. Drawn as
+                // live text over the cached gutter image so a toggle
+                // updates without repainting the pixel buffer.
+                if !fold_rows.is_empty() {
+                    let gutter_clip = Rectangle::new(
+                        Point::new(0.0, 0.0),
+                        Size::new(fold_band as f32, image_h as f32),
+                    );
+                    for (line_top, _line_w, folded) in &fold_rows {
+                        renderer.fill_text(
+                            fold_text(if *folded { "\u{25b8}" } else { "\u{25be}" }),
+                            Point::new(
+                                fold_band as f32 / 2.0,
+                                line_top + metrics.line_height / 2.0,
+                            ),
+                            fold_arrow_color,
+                            gutter_clip,
+                        );
+                    }
                 }
 
                 // Calculate editor position
@@ -778,6 +1034,25 @@ where
                         _ => {
                             log::error!("cosmic-text buffer not an Arc");
                         }
+                    }
+
+                    // A folded start line gets a dim "…" after its text —
+                    // the fold swallowed the lines below it.
+                    for (line_top, line_w, folded) in &fold_rows {
+                        if !*folded {
+                            continue;
+                        }
+                        let mut ellipsis = fold_text("\u{2026}");
+                        ellipsis.align_x = text::Alignment::Left;
+                        renderer.fill_text(
+                            ellipsis,
+                            Point::new(
+                                pos.x + line_w + metrics.font_size * 0.4,
+                                line_top + metrics.line_height / 2.0,
+                            ),
+                            fold_ellipsis_color,
+                            clip_bounds,
+                        );
                     }
                 })
             })
@@ -1248,6 +1523,40 @@ where
                             }
                             state.click = Some((click_kind, Instant::now()));
                             state.dragging = Some(Dragging::Buffer);
+                        } else if x < 0.0 && x_logical >= 0.0 && self.fold_gutter.is_some() {
+                            // Click in the gutter band: toggle the fold whose
+                            // range starts on the clicked row. Same line-space
+                            // translation and staleness gate as the drawn
+                            // arrows — a suppressed arrow is not clickable.
+                            if let (Some(fold), Some(on_fold_toggle)) =
+                                (&self.fold_gutter, &self.on_fold_toggle)
+                            {
+                                let toggle = editor.with_buffer(|buffer| {
+                                    let map = chunk_line_map(buffer);
+                                    if ChunkLineMap::real_line_count(map.as_ref(), buffer)
+                                        != fold.parsed_lines
+                                    {
+                                        return None;
+                                    }
+                                    let line_height = buffer.metrics().line_height;
+                                    for run in buffer.layout_runs() {
+                                        if y >= run.line_top && y < run.line_top + line_height {
+                                            let parsed = ChunkLineMap::parsed_line(
+                                                map.as_ref(),
+                                                run.line_i,
+                                            )?;
+                                            return fold
+                                                .markers
+                                                .contains_key(&parsed)
+                                                .then_some(parsed);
+                                        }
+                                    }
+                                    None
+                                });
+                                if let Some(line) = toggle {
+                                    shell.publish(on_fold_toggle(line));
+                                }
+                            }
                         } else if let Some(scrollbar_v_rect) = scrollbar_v_rect {
                             if scrollbar_v_rect.contains(Point::new(x_logical, y_logical)) {
                                 state.dragging = Some(Dragging::ScrollbarV {
@@ -1257,13 +1566,27 @@ where
                             } else if x_logical >= scrollbar_v_rect.x
                                 && x_logical < (scrollbar_v_rect.x + scrollbar_v_rect.width)
                             {
+                                let use_visible = self.fold_gutter.is_some();
                                 editor.with_buffer_mut(|buffer| {
                                     let mut scroll = buffer.scroll();
+                                    // Visible line units while folds can hide
+                                    // lines: the track spans visible lines only.
+                                    let lines = if use_visible {
+                                        buffer.visible_line_count()
+                                    } else {
+                                        buffer.line_count()
+                                    };
                                     //TODO: if buffer height is undefined, what should this do?
                                     let scroll_line = ((y / buffer.size().1.unwrap_or(1.0))
-                                        * buffer.lines.len() as f32)
+                                        * lines as f32)
                                         as i32;
-                                    scroll.line = scroll_line.try_into().unwrap_or_default();
+                                    let index: usize =
+                                        scroll_line.try_into().unwrap_or_default();
+                                    scroll.line = if use_visible {
+                                        nth_visible_line(buffer, index)
+                                    } else {
+                                        index
+                                    };
                                     buffer.set_scroll(scroll);
                                     state.dragging = Some(Dragging::ScrollbarV {
                                         start_y: y,
@@ -1333,16 +1656,36 @@ where
                                 start_y,
                                 start_scroll,
                             } => {
+                                let use_visible = self.fold_gutter.is_some();
                                 editor.with_buffer_mut(|buffer| {
                                     let mut scroll = buffer.scroll();
+                                    // Visible line units while folds can hide
+                                    // lines (identical to plain lines otherwise).
+                                    let lines = if use_visible {
+                                        buffer.visible_line_count()
+                                    } else {
+                                        buffer.line_count()
+                                    };
                                     //TODO: if buffer size is undefined, what should this do?
                                     let scroll_offset = (((y - start_y)
                                         / buffer.size().1.unwrap_or(1.0))
-                                        * buffer.lines.len() as f32)
+                                        * lines as f32)
                                         as i32;
-                                    scroll.line = (start_scroll.line as i32 + scroll_offset)
-                                        .try_into()
-                                        .unwrap_or_default();
+                                    if use_visible {
+                                        // Offset from the drag-start line's
+                                        // visible index, mapped back to an
+                                        // absolute line.
+                                        let start_index =
+                                            visible_lines_before(buffer, start_scroll.line) as i32;
+                                        let index: usize = (start_index + scroll_offset)
+                                            .try_into()
+                                            .unwrap_or_default();
+                                        scroll.line = nth_visible_line(buffer, index);
+                                    } else {
+                                        scroll.line = (start_scroll.line as i32 + scroll_offset)
+                                            .try_into()
+                                            .unwrap_or_default();
+                                    }
                                     buffer.set_scroll(scroll);
                                 });
                             }

@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use crate::json_scan::{self, JsonKind, JsonNode, JsonTree};
+use crate::json_scan::{self, FoldRange, JsonKind, JsonNode, JsonTree};
 
 /// Pre-order index of a node in the parsed tree.
 pub type NodeId = usize;
@@ -42,6 +42,124 @@ struct NodeMeta {
     depth: u16,
 }
 
+/// Default fold depth applied right after a successful Format: every range
+/// nested at depth 2 or deeper folds, so the root and its top-level keys
+/// stay visible while their contents collapse.
+pub const DEFAULT_FOLD_LEVEL: u32 = 2;
+
+/// Fold state over the ranges from [`json_scan::fold_ranges`], in the
+/// *parsed-text* line space. `folded` holds the `start_line` of every folded
+/// range; the hidden-line set is always the union of the folded ranges'
+/// interiors (`start_line + 1 ..= end_line`), so unfolding an outer range
+/// automatically re-applies any nested folded ranges — they never left the
+/// set. Pure state: applying it to a buffer is the tab's job
+/// (`EditorTab::sync_folds`), which also translates parsed lines to buffer
+/// rows when display chunking is active.
+#[derive(Clone, Debug, Default)]
+pub struct FoldState {
+    pub ranges: Vec<FoldRange>,
+    pub folded: HashSet<u32>,
+}
+
+impl FoldState {
+    /// Whether any foldable range exists at all (gates the gutter arrows
+    /// and the View-menu fold commands).
+    pub fn has_ranges(&self) -> bool {
+        !self.ranges.is_empty()
+    }
+
+    /// Replace the ranges after a re-parse. Folded start lines that no
+    /// longer start a range are dropped; the rest carry over. Callers with
+    /// a live buffer re-derive `folded` from the buffer's hidden flags
+    /// afterwards (the flags move with their lines through edits, so the
+    /// buffer is the ground truth) — this pure carry is the bufferless
+    /// fallback.
+    pub fn set_ranges(&mut self, ranges: Vec<FoldRange>) {
+        self.ranges = ranges;
+        self.folded
+            .retain(|line| self.ranges.iter().any(|range| range.start_line == *line));
+    }
+
+    /// The fold range starting at `line`, if any. Ranges sharing a start
+    /// line were deduped by the scanner, so this is unique.
+    pub fn range_starting(&self, line: u32) -> Option<&FoldRange> {
+        self.ranges.iter().find(|range| range.start_line == line)
+    }
+
+    pub fn is_folded(&self, line: u32) -> bool {
+        self.folded.contains(&line)
+    }
+
+    /// Toggle the fold whose range starts at `line`. Returns true when the
+    /// state changed (false when no range starts there).
+    pub fn toggle(&mut self, line: u32) -> bool {
+        if self.range_starting(line).is_none() {
+            return false;
+        }
+        if !self.folded.remove(&line) {
+            self.folded.insert(line);
+        }
+        true
+    }
+
+    pub fn fold_all(&mut self) {
+        self.folded = self.ranges.iter().map(|range| range.start_line).collect();
+    }
+
+    pub fn unfold_all(&mut self) {
+        self.folded.clear();
+    }
+
+    /// Fold every range with nesting depth >= `level`, unfold the rest.
+    /// Level 1 folds everything including the root container; level 2 keeps
+    /// the root and its immediate keys visible.
+    pub fn fold_level(&mut self, level: u32) {
+        self.folded = self
+            .ranges
+            .iter()
+            .filter(|range| range.depth >= level)
+            .map(|range| range.start_line)
+            .collect();
+    }
+
+    /// Unfold every folded range that hides `line` (i.e. whose interior
+    /// `start_line + 1 ..= end_line` contains it), so a jump to that line
+    /// lands on a visible row. A folded range *starting* at `line` stays
+    /// folded — the start line itself is visible. Returns true when
+    /// anything unfolded.
+    pub fn unfold_lines_containing(&mut self, line: u32) -> bool {
+        let mut changed = false;
+        for range in &self.ranges {
+            if range.start_line < line
+                && line <= range.end_line
+                && self.folded.remove(&range.start_line)
+            {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The hidden-line mask in parsed-text line space: `mask[i]` is true
+    /// when line `i` is inside a folded range's interior. Always the full
+    /// union over `folded`, which is what makes fold/unfold idempotent and
+    /// nested folds re-apply on unfold.
+    pub fn hidden_mask(&self, line_count: usize) -> Vec<bool> {
+        let mut mask = vec![false; line_count];
+        for range in &self.ranges {
+            if !self.folded.contains(&range.start_line) {
+                continue;
+            }
+            let from = (range.start_line as usize + 1).min(line_count);
+            let to_exclusive = (range.end_line as usize + 1).min(line_count);
+            for hidden in &mut mask[from..to_exclusive] {
+                *hidden = true;
+            }
+        }
+        mask
+    }
+}
+
 /// Per-tab JSON support state: the minified-file banner flag (Phase B), the
 /// cached span AST and the tree-pane interaction state. The fold phases
 /// extend it further.
@@ -60,6 +178,9 @@ pub struct JsonViewState {
     pub selected: Option<NodeId>,
     /// Row targeted by the open context menu.
     pub context_node: Option<NodeId>,
+    /// Fold ranges + folded set, in parsed-text line space. Applied to the
+    /// buffer's per-line hidden flags by `EditorTab::sync_folds`.
+    pub fold: FoldState,
     meta: Vec<NodeMeta>,
     /// Byte offset where each source line starts, same line-break pairing as
     /// the scanner ("\r\n" / "\n\r" are single breaks). Maps buffer cursor
@@ -84,6 +205,7 @@ impl Default for JsonViewState {
             filter: String::new(),
             selected: None,
             context_node: None,
+            fold: FoldState::default(),
             meta: Vec::new(),
             line_starts: Vec::new(),
             text_len: 0,
@@ -142,6 +264,7 @@ impl JsonViewState {
         self.meta = build_meta(&self.tree);
         self.line_starts = compute_line_starts(text);
         self.text_len = text.len();
+        self.fold.set_ranges(json_scan::fold_ranges(text));
 
         let carried: HashSet<NodeId> = self
             .meta
@@ -414,6 +537,14 @@ impl JsonViewState {
         }
     }
 
+    /// The "default fold level 2 after Format" hook: fold every range
+    /// nested at [`DEFAULT_FOLD_LEVEL`] or deeper. Callers run this AFTER
+    /// [`JsonViewState::rebuild`] against the formatted text (the ranges
+    /// must describe the new line space) and then sync the buffer's hidden
+    /// flags via `EditorTab::sync_folds`.
+    pub fn apply_default_fold_level(&mut self) {
+        self.fold.fold_level(DEFAULT_FOLD_LEVEL);
+    }
 }
 
 /// Pre-order walk assigning ids and computing parent/subtree/path-hash.
@@ -931,6 +1062,196 @@ mod tests {
         assert_eq!(state.follow_offset(0), None);
         state.set_filter("x".to_string());
         assert!(state.visible_rows().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // FoldState
+    // -----------------------------------------------------------------
+
+    /// NESTED's fold ranges: the root object (depth 1), the "db" object
+    /// (depth 2) and the "posts" array (depth 3). The single-line post
+    /// objects and "meta" emit no ranges.
+    fn fold_state() -> FoldState {
+        let mut fold = FoldState::default();
+        fold.set_ranges(json_scan::fold_ranges(NESTED));
+        fold
+    }
+
+    fn hidden_lines(fold: &FoldState) -> Vec<usize> {
+        let line_count = NESTED.lines().count();
+        fold.hidden_mask(line_count)
+            .iter()
+            .enumerate()
+            .filter(|(_, hidden)| **hidden)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Fold hides exactly `start_line + 1 ..= end_line`; unfold restores;
+    /// repeating the cycle lands in identical states every time.
+    #[test]
+    fn fold_unfold_idempotent() {
+        let mut fold = fold_state();
+        let posts = fold
+            .ranges
+            .iter()
+            .find(|r| matches!(r.kind, json_scan::FoldKind::Array))
+            .copied()
+            .expect("posts array range");
+
+        assert!(fold.toggle(posts.start_line), "range start must toggle");
+        let folded_once = hidden_lines(&fold);
+        let interior: Vec<usize> =
+            (posts.start_line as usize + 1..=posts.end_line as usize).collect();
+        assert_eq!(folded_once, interior);
+
+        assert!(fold.toggle(posts.start_line));
+        assert!(hidden_lines(&fold).is_empty(), "unfold restores everything");
+
+        assert!(fold.toggle(posts.start_line));
+        assert_eq!(
+            hidden_lines(&fold),
+            folded_once,
+            "re-fold reproduces the same hidden set"
+        );
+
+        assert!(
+            !fold.toggle(999),
+            "a line with no range must not toggle anything"
+        );
+
+        fold.fold_all();
+        let all = hidden_lines(&fold);
+        fold.fold_all();
+        assert_eq!(hidden_lines(&fold), all, "fold_all is idempotent");
+        fold.unfold_all();
+        assert!(hidden_lines(&fold).is_empty());
+    }
+
+    /// A nested folded range survives folding and unfolding its ancestor:
+    /// unfold of the outer range re-applies the inner fold because the
+    /// hidden set is always the union over `folded`.
+    #[test]
+    fn nested_folds_reapply_after_outer_unfold() {
+        let mut fold = fold_state();
+        let ranges = fold.ranges.clone();
+        // NESTED: root object (depth 1), "db" object (depth 2), "posts"
+        // array (depth 3).
+        let db = ranges.iter().find(|r| r.depth == 2).unwrap().start_line;
+        let posts = ranges.iter().find(|r| r.depth == 3).unwrap().start_line;
+
+        assert!(fold.toggle(posts), "fold inner first");
+        let inner_only = hidden_lines(&fold);
+
+        assert!(fold.toggle(db), "then fold outer");
+        let with_outer = hidden_lines(&fold);
+        assert!(
+            with_outer.len() > inner_only.len(),
+            "outer fold hides a superset"
+        );
+        assert!(
+            with_outer.contains(&(posts as usize)),
+            "the inner range's start line itself hides inside the outer fold"
+        );
+
+        assert!(fold.toggle(db), "unfold outer");
+        assert_eq!(
+            hidden_lines(&fold),
+            inner_only,
+            "inner fold must re-apply exactly after the outer unfold"
+        );
+        assert!(fold.is_folded(posts));
+    }
+
+    /// fold_level(N) folds every range with depth >= N and unfolds the
+    /// rest; level 1 folds the root too.
+    #[test]
+    fn fold_level_selects_by_depth() {
+        let mut fold = fold_state();
+        let ranges = fold.ranges.clone();
+        let max_depth = ranges.iter().map(|r| r.depth).max().unwrap();
+        assert!(max_depth >= 3, "test document must nest at least 3 deep");
+
+        for level in 1..=max_depth {
+            fold.fold_level(level);
+            for range in &ranges {
+                assert_eq!(
+                    fold.is_folded(range.start_line),
+                    range.depth >= level,
+                    "level {level}: range at depth {} starting line {}",
+                    range.depth,
+                    range.start_line
+                );
+            }
+        }
+
+        // The default post-format level keeps the root visible.
+        fold.fold_level(DEFAULT_FOLD_LEVEL);
+        let root = ranges.iter().find(|r| r.depth == 1).unwrap();
+        assert!(!fold.is_folded(root.start_line));
+        // And a later fold_level fully replaces the selection (unfolds
+        // deeper-only folds when the level rises).
+        fold.fold_level(max_depth);
+        for range in ranges.iter().filter(|r| r.depth < max_depth) {
+            assert!(!fold.is_folded(range.start_line));
+        }
+    }
+
+    /// Jump support: unfolding everything that hides a target line opens
+    /// exactly the ancestor chain, leaving sibling folds alone, and keeps a
+    /// range folded when the target is its own (visible) start line.
+    #[test]
+    fn unfold_lines_containing_opens_ancestors_only() {
+        let mut fold = fold_state();
+        fold.fold_all();
+        let ranges = fold.ranges.clone();
+        let posts = ranges.iter().find(|r| r.depth == 3).unwrap();
+
+        // A line inside the posts array (a post object's interior).
+        let target = posts.start_line + 2;
+        assert!(fold.unfold_lines_containing(target));
+        for range in &ranges {
+            let hides_target = range.start_line < target && target <= range.end_line;
+            assert_eq!(
+                fold.is_folded(range.start_line),
+                !hides_target,
+                "only ranges hiding line {target} may unfold (range at {})",
+                range.start_line
+            );
+        }
+
+        // Target exactly on a folded start line: that fold stays.
+        fold.fold_all();
+        assert!(fold.unfold_lines_containing(posts.start_line));
+        assert!(
+            fold.is_folded(posts.start_line),
+            "a range starting at the target stays folded — its start line is visible"
+        );
+
+        assert!(
+            !fold.unfold_lines_containing(posts.start_line),
+            "second call: nothing left to unfold"
+        );
+    }
+
+    /// set_ranges drops folds whose start line no longer starts a range
+    /// and keeps the ones that survived the re-parse.
+    #[test]
+    fn set_ranges_retains_only_live_folds() {
+        let mut fold = fold_state();
+        fold.fold_all();
+        let flat = "{\n  \"only\": 1\n}";
+        fold.set_ranges(json_scan::fold_ranges(flat));
+        assert_eq!(fold.ranges.len(), 1);
+        assert!(
+            fold.is_folded(0),
+            "the root range still starts at line 0, its fold carries"
+        );
+        assert_eq!(
+            fold.folded.len(),
+            1,
+            "folds at start lines that vanished must drop"
+        );
     }
 
     /// Huge child lists produce more visible rows than the widget layer

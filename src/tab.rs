@@ -5,7 +5,9 @@ use cosmic::{
     widget::icon,
 };
 use cosmic_files::mime_icon::{FALLBACK_MIME_ICON, mime_for_path, mime_icon};
-use cosmic_text::{Attrs, Buffer, Cursor, Edit, Selection, Shaping, SyntaxEditor, ViEditor, Wrap};
+use cosmic_text::{
+    Attrs, Buffer, Cursor, Edit, LineEnding, Selection, Shaping, SyntaxEditor, ViEditor, Wrap,
+};
 use regex::Regex;
 use std::{
     fs,
@@ -23,12 +25,49 @@ const JSON_FORMAT_INDENT: &str = "  ";
 fn editor_text(editor: &ViEditor<'static, 'static>) -> String {
     editor.with_buffer(|buffer| {
         let mut text = String::new();
-        for line in buffer.lines.iter() {
-            text.push_str(line.text());
-            text.push_str(line.ending().as_str());
+        for i in 0..buffer.line_count() {
+            if let Some(cow) = buffer.line_text_cow(i) {
+                text.push_str(&cow);
+            }
+            if let Some(ending) = buffer.line_ending(i) {
+                text.push_str(ending.as_str());
+            }
         }
         text
     })
+}
+
+/// Map parsed-text lines to buffer rows for fold application: `row_of[p]`
+/// is the first buffer row of parsed line `p`, with a trailing sentinel of
+/// `line_count`, so parsed line `p` occupies rows `row_of[p]..row_of[p+1]`.
+///
+/// A buffer row continues the previous parsed line iff the previous row's
+/// ending is [`LineEnding::None`] — a display-chunk join. The final row of a
+/// no-trailing-newline document also ends in None but has no follower, so it
+/// never miscounts (same rule as the gutter's chunk map and minified
+/// detection). Identity (plus sentinel) when no line is chunked.
+///
+/// Returns `None` when the buffer's real-line count differs from
+/// `parsed_lines` — the buffer drifted from the text the ranges were parsed
+/// from (mid-debounce edit) — or for empty buffers. Full-arm only; callers
+/// check `is_rope` first.
+fn fold_row_map(buffer: &Buffer, parsed_lines: usize) -> Option<Vec<usize>> {
+    let count = buffer.line_count();
+    if count == 0 {
+        return None;
+    }
+    let mut row_of = Vec::with_capacity(parsed_lines + 1);
+    row_of.push(0usize);
+    for row in 0..count - 1 {
+        if buffer.line_ending(row) != Some(LineEnding::None) {
+            row_of.push(row + 1);
+        }
+    }
+    if row_of.len() != parsed_lines {
+        return None;
+    }
+    row_of.push(count);
+    Some(row_of)
 }
 
 pub enum Tab {
@@ -170,7 +209,22 @@ impl EditorTab {
         let minified = {
             let editor = self.editor.lock().unwrap();
             editor.with_buffer(|buffer| {
-                buffer.lines.len() <= MINIFIED_MAX_LINES && byte_len > MINIFIED_MIN_BYTES
+                let count = buffer.line_count();
+                if count <= MINIFIED_MAX_LINES && byte_len > MINIFIED_MIN_BYTES {
+                    true
+                } else if buffer.is_rope() {
+                    // Rope lines split on real endings only — display
+                    // chunking is set_text (Full arm) behavior — so skip
+                    // the O(lines) cold ending walk.
+                    false
+                } else {
+                    // Any chunk join: an ending of LineEnding::None with a
+                    // line after it. The final line of a no-trailing-newline
+                    // document also has ending None but no follower, so it
+                    // does not trip this.
+                    (0..count.saturating_sub(1))
+                        .any(|i| buffer.line_ending(i) == Some(LineEnding::None))
+                }
             })
         };
         self.json_view = Some(JsonViewState::from_text(&self.text(), minified));
@@ -185,14 +239,10 @@ impl EditorTab {
         let editor = self.editor.lock().unwrap();
         editor.with_buffer(|buffer| {
             let mut start = 0;
-            let count = buffer.lines.len();
+            let count = buffer.line_count();
             for i in 0..count {
-                let text_len = buffer.lines.get(i).map(|line| line.text().len()).unwrap_or(0);
-                let ending_len = buffer
-                    .lines
-                    .get(i)
-                    .map(|line| line.ending().as_str().len())
-                    .unwrap_or(0);
+                let text_len = buffer.line_text_cow(i).map(|t| t.len()).unwrap_or(0);
+                let ending_len = buffer.line_ending(i).map(|e| e.as_str().len()).unwrap_or(0);
                 if offset < start + text_len + ending_len || i + 1 == count {
                     return (i, offset.saturating_sub(start).min(text_len));
                 }
@@ -211,21 +261,21 @@ impl EditorTab {
     /// Number of lines the buffer holds.
     pub fn total_line_count(&self) -> usize {
         let editor = self.editor.lock().unwrap();
-        editor.with_buffer(|buffer| buffer.lines.len())
+        editor.with_buffer(|buffer| buffer.line_count())
+    }
+
+    /// Whether this tab is backed by a rope store (large file).
+    pub fn uses_rope_buffer(&self) -> bool {
+        let editor = self.editor.lock().unwrap();
+        editor.with_buffer(|buffer| buffer.is_rope())
     }
 
     /// Set the cursor position (clamped to valid range).
     pub fn set_cursor(&mut self, line: usize, index: usize) {
         let mut editor = self.editor.lock().unwrap();
         let cursor = editor.with_buffer(|buffer| {
-            let line = line.min(buffer.lines.len().saturating_sub(1));
-            let index = index.min(
-                buffer
-                    .lines
-                    .get(line)
-                    .map(|l| l.text().len())
-                    .unwrap_or(0),
-            );
+            let line = line.min(buffer.line_count().saturating_sub(1));
+            let index = index.min(buffer.line_text_cow(line).map(|t| t.len()).unwrap_or(0));
             Cursor::new(line, index)
         });
         editor.set_cursor(cursor);
@@ -264,13 +314,12 @@ impl EditorTab {
             // Grab everything in the buffer (same select-all shape as reload)
             let cursor_start = Cursor::new(0, 0);
             let cursor_end = editor.with_buffer(|buffer| {
-                let last_line = buffer.lines.len().saturating_sub(1);
+                let last_line = buffer.line_count().saturating_sub(1);
                 Cursor::new(
                     last_line,
                     buffer
-                        .lines
-                        .get(last_line)
-                        .map(|line| line.text().len())
+                        .line_text_cow(last_line)
+                        .map(|text| text.len())
                         .unwrap_or(0),
                 )
             });
@@ -285,8 +334,159 @@ impl EditorTab {
         }
         if let Some(json_view) = &mut self.json_view {
             json_view.banner = false;
+            // The default fold level is applied by the caller AFTER it
+            // rebuilds the view against the formatted text — the fold
+            // ranges must describe the new line space, not this stale one.
         }
         true
+    }
+
+    /// Apply the tab's fold state ([`JsonViewState::fold`]) to the buffer's
+    /// per-line hidden flags.
+    ///
+    /// Fold ranges live in *parsed-text* line space; buffer rows differ when
+    /// display chunking split an over-long line into rows joined by
+    /// [`LineEnding::None`]. The row map below sends parsed line `p` to its
+    /// first buffer row; a folded range then hides buffer rows
+    /// `[row_of[start+1], row_of[end+1])` — every row of every interior
+    /// parsed line, chunk continuations included.
+    ///
+    /// Every row's flag is written on every sync (the mask is the full union
+    /// over folded ranges), which is what makes fold/unfold idempotent,
+    /// re-applies nested folds when an outer range unfolds, and clears
+    /// orphaned flags after ranges change.
+    ///
+    /// Inert on rope tabs — the rope arm has no hidden storage and the
+    /// fold UI is not offered there. When the buffer's real-line structure
+    /// no longer matches the parsed line count (edits during the rebuild
+    /// debounce), all flags clear instead: never hide rows the ranges don't
+    /// describe. A cursor swallowed by a new fold lands at the end of the
+    /// nearest visible row above, mirroring the hidden-line motion rule.
+    pub fn sync_folds(&mut self) {
+        let Some(view) = &self.json_view else {
+            return;
+        };
+        let parsed_lines = view.aligned_line_count();
+        let mask = view.fold.hidden_mask(parsed_lines);
+        let mut editor = self.editor.lock().unwrap();
+        let applied = editor.with_buffer_mut(|buffer| {
+            if buffer.is_rope() {
+                return false;
+            }
+            let count = buffer.line_count();
+            match fold_row_map(buffer, parsed_lines) {
+                Some(row_of) => {
+                    for (parsed, hide) in mask.iter().enumerate() {
+                        for row in row_of[parsed]..row_of[parsed + 1] {
+                            buffer.set_line_hidden(row, *hide);
+                        }
+                    }
+                    true
+                }
+                None => {
+                    for row in 0..count {
+                        buffer.set_line_hidden(row, false);
+                    }
+                    false
+                }
+            }
+        });
+        if applied {
+            let cursor = editor.cursor();
+            let clamp = editor.with_buffer(|buffer| {
+                if !buffer.line_hidden(cursor.line) {
+                    return None;
+                }
+                // Interiors start at start_line + 1, so row 0 is always
+                // visible and this walk terminates.
+                let mut line = cursor.line;
+                while line > 0 && buffer.line_hidden(line) {
+                    line -= 1;
+                }
+                let index = buffer.line_text_cow(line).map(|t| t.len()).unwrap_or(0);
+                Some(Cursor::new(line, index))
+            });
+            if let Some(cursor) = clamp {
+                editor.set_cursor(cursor);
+            }
+        }
+    }
+
+    /// Re-derive which ranges are folded from the buffer's hidden flags,
+    /// then re-apply the mask. Run after [`JsonViewState::rebuild`]: the
+    /// flags moved with their lines through the edit (they live on the
+    /// `BufferLine`s), so they are the ground truth for what the user had
+    /// folded, while the re-parsed ranges describe the new line space. A
+    /// range is folded iff the first row of its interior is hidden; the
+    /// follow-up sync clears any hidden rows no range explains anymore.
+    pub fn resync_folds_from_buffer(&mut self) {
+        let Some(view) = &self.json_view else {
+            return;
+        };
+        let parsed_lines = view.aligned_line_count();
+        let ranges = view.fold.ranges.clone();
+        let folded = {
+            let editor = self.editor.lock().unwrap();
+            editor.with_buffer(|buffer| {
+                if buffer.is_rope() {
+                    return None;
+                }
+                let row_of = fold_row_map(buffer, parsed_lines)?;
+                Some(
+                    ranges
+                        .iter()
+                        .filter(|range| buffer.line_hidden(row_of[range.start_line as usize + 1]))
+                        .map(|range| range.start_line)
+                        .collect::<std::collections::HashSet<u32>>(),
+                )
+            })
+        };
+        if let Some(view) = self.json_view.as_mut() {
+            view.fold.folded = folded.unwrap_or_default();
+        }
+        self.sync_folds();
+    }
+
+    /// Unfold whatever hides the cursor's row, then re-sync the hidden
+    /// flags so the row is visible. Search (Find Next / Find Previous) and
+    /// programmatic jumps set the cursor with no fold awareness; a match
+    /// inside a folded region otherwise selects an invisible row — the
+    /// cursor and highlight render nowhere and repeated Find Next looks
+    /// dead. Same auto-unfold rule as a tree jump: ancestors open, sibling
+    /// folds stay folded.
+    ///
+    /// O(1) when the cursor row is visible (the common case) or on rope
+    /// tabs (nothing is ever hidden there). When the row map has drifted
+    /// from the parsed line space, the sync alone still reveals: it clears
+    /// every flag the ranges no longer describe.
+    pub fn reveal_cursor_folds(&mut self) {
+        let Some(view) = &self.json_view else {
+            return;
+        };
+        let parsed_lines = view.aligned_line_count();
+        let hidden_parsed = {
+            let editor = self.editor.lock().unwrap();
+            let row = editor.cursor().line;
+            editor.with_buffer(|buffer| {
+                if buffer.is_rope() || !buffer.line_hidden(row) {
+                    return None;
+                }
+                // Same row map as sync_folds; chunk continuation rows map
+                // back to the parsed line they belong to.
+                Some(fold_row_map(buffer, parsed_lines).map(|row_of| {
+                    (row_of.partition_point(|&first_row| first_row <= row) - 1) as u32
+                }))
+            })
+        };
+        let Some(parsed) = hidden_parsed else {
+            return;
+        };
+        if let Some(line) = parsed
+            && let Some(view) = self.json_view.as_mut()
+        {
+            view.fold.unfold_lines_containing(line);
+        }
+        self.sync_folds();
     }
 
     /// Check if this tab contains a JSON file.
@@ -323,13 +523,12 @@ impl EditorTab {
                     // Grab everything in the buffer
                     let cursor_start: Cursor = cosmic_text::Cursor::new(0, 0);
                     let cursor_end = editor.with_buffer(|buffer| {
-                        let last_line = buffer.lines.len().saturating_sub(1);
+                        let last_line = buffer.line_count().saturating_sub(1);
                         cosmic_text::Cursor::new(
                             last_line,
                             buffer
-                                .lines
-                                .get(last_line)
-                                .map(|line| line.text().len())
+                                .line_text_cow(last_line)
+                                .map(|text| text.len())
                                 .unwrap_or(0),
                         )
                     });
@@ -341,10 +540,10 @@ impl EditorTab {
                     // Adjust cursor to closest position
                     let mut cursor = editor.cursor();
                     editor.with_buffer(|buffer| {
-                        cursor.line = cursor.line.min(buffer.lines.len().saturating_sub(1));
-                        cursor.index = if let Some(line) = buffer.lines.get(cursor.line) {
-                            let mut closest = line.text().len();
-                            for (i, _) in line.text().char_indices().rev() {
+                        cursor.line = cursor.line.min(buffer.line_count().saturating_sub(1));
+                        cursor.index = if let Some(text) = buffer.line_text_cow(cursor.line) {
+                            let mut closest = text.len();
+                            for (i, _) in text.char_indices().rev() {
                                 if i >= cursor.index {
                                     closest = i;
                                 } else {
@@ -472,10 +671,13 @@ impl EditorTab {
         let mut cursor = editor.cursor();
         let mut wrapped = false; // Keeps track of whether the search has wrapped around yet.
         let start_line = cursor.line;
-        while cursor.line < editor.with_buffer(|buffer| buffer.lines.len()) {
+        while cursor.line < editor.with_buffer(|buffer| buffer.line_count()) {
             if let Some((index, len)) = editor.with_buffer(|buffer| {
+                let text = buffer
+                    .line_text_cow(cursor.line)
+                    .expect("cursor line in bounds");
                 regex
-                    .find_iter(buffer.lines[cursor.line].text())
+                    .find_iter(&text)
                     .filter_map(|m| {
                         if cursor.line != start_line
                             || m.start() >= cursor.index
@@ -499,9 +701,13 @@ impl EditorTab {
                     if cursor.line > 0 {
                         // move the cursor up one line
                         cursor.line -= 1;
-                        cursor.index =
-                            editor.with_buffer(|buffer| buffer.lines[cursor.line].text().len());
-                    } else if cursor.line + 1 < editor.with_buffer(|buffer| buffer.lines.len()) {
+                        cursor.index = editor.with_buffer(|buffer| {
+                            buffer
+                                .line_text_cow(cursor.line)
+                                .expect("cursor line in bounds")
+                                .len()
+                        });
+                    } else if cursor.line + 1 < editor.with_buffer(|buffer| buffer.line_count()) {
                         // move the end down one line
                         end.line += 1;
                         end.index = 0;
@@ -522,7 +728,7 @@ impl EditorTab {
             // set wrapped to true so we don't wrap again
             if wrap_around
                 && !wrapped
-                && cursor.line == editor.with_buffer(|buffer| buffer.lines.len())
+                && cursor.line == editor.with_buffer(|buffer| buffer.line_count())
             {
                 cursor.line = 0;
                 wrapped = true;
@@ -548,10 +754,13 @@ impl EditorTab {
         let current_selection = editor.selection();
 
         if forwards {
-            while cursor.line < editor.with_buffer(|buffer| buffer.lines.len()) {
+            while cursor.line < editor.with_buffer(|buffer| buffer.line_count()) {
                 if let Some((start, end)) = editor.with_buffer(|buffer| {
+                    let text = buffer
+                        .line_text_cow(cursor.line)
+                        .expect("cursor line in bounds");
                     regex
-                        .find_iter(buffer.lines[cursor.line].text())
+                        .find_iter(&text)
                         .filter_map(|m| {
                             if cursor.line != start_line
                                 || m.start() > cursor.index
@@ -581,7 +790,7 @@ impl EditorTab {
                 // set wrapped to true so we don't wrap again
                 if wrap_around
                     && !wrapped
-                    && cursor.line == editor.with_buffer(|buffer| buffer.lines.len())
+                    && cursor.line == editor.with_buffer(|buffer| buffer.line_count())
                 {
                     cursor.line = 0;
                     wrapped = true;
@@ -593,8 +802,11 @@ impl EditorTab {
                 cursor.line -= 1;
 
                 if let Some((start, end)) = editor.with_buffer(|buffer| {
+                    let text = buffer
+                        .line_text_cow(cursor.line)
+                        .expect("cursor line in bounds");
                     regex
-                        .find_iter(buffer.lines[cursor.line].text())
+                        .find_iter(&text)
                         .filter_map(|m| {
                             if cursor.line != start_line
                                 || m.start() < cursor.index
@@ -621,7 +833,7 @@ impl EditorTab {
                 // If we haven't wrapped yet and we've reached the first line, reset cursor line to the
                 // last line and set wrapped to true so we don't wrap again
                 if wrap_around && !wrapped && cursor.line == 0 {
-                    cursor.line = editor.with_buffer(|buffer| buffer.lines.len());
+                    cursor.line = editor.with_buffer(|buffer| buffer.line_count());
                     wrapped = true;
                 }
             }

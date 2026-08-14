@@ -207,6 +207,9 @@ pub enum Action {
     Cut,
     Find,
     FindAndReplace,
+    JsonFoldAll,
+    JsonFoldLevel(u32),
+    JsonUnfoldAll,
     NewFile,
     NewWindow,
     OpenFileDialog,
@@ -257,6 +260,9 @@ impl Action {
             Self::Cut => Message::Cut,
             Self::Find => Message::Find(Some(false)),
             Self::FindAndReplace => Message::Find(Some(true)),
+            Self::JsonFoldAll => Message::JsonFoldAll,
+            Self::JsonFoldLevel(level) => Message::JsonFoldLevel(*level),
+            Self::JsonUnfoldAll => Message::JsonUnfoldAll,
             Self::NewFile => Message::NewFile,
             Self::NewWindow => Message::NewWindow,
             Self::OpenFileDialog => Message::OpenFileDialog,
@@ -377,6 +383,15 @@ pub enum Message {
     JsonFormat(segmented_button::Entity),
     /// Dismiss the minified-JSON banner without formatting.
     JsonBannerDismiss(segmented_button::Entity),
+    /// Gutter arrow click: toggle the fold range starting at this
+    /// parsed-text line.
+    JsonFoldToggle(segmented_button::Entity, u32),
+    /// View menu: fold every range in the active JSON tab.
+    JsonFoldAll,
+    /// View menu: unfold every range in the active JSON tab.
+    JsonUnfoldAll,
+    /// View menu: fold every range nested at this depth or deeper.
+    JsonFoldLevel(u32),
     /// Tree pane: toggle a node's expansion (chevron click).
     JsonTreeToggle(segmented_button::Entity, json_tree::NodeId),
     /// Tree pane: jump the editor cursor to a node's value (row click).
@@ -1019,8 +1034,8 @@ impl App {
         if let Some(Tab::Editor(tab)) = self.active_tab() {
             let editor = tab.editor.lock().unwrap();
             editor.with_buffer(|buffer| {
-                line_count = buffer.lines.len();
-                for line in buffer.lines.iter() {
+                line_count = buffer.line_count();
+                for line in buffer.lines_iter() {
                     let text = line.text();
                     let mut last_whitespace = true;
 
@@ -1919,7 +1934,7 @@ impl Application for App {
                                 {
                                     let mut editor = tab.editor.lock().unwrap();
                                     editor.with_buffer_mut(|buffer| {
-                                        for line in buffer.lines.iter_mut() {
+                                        for line in buffer.lines_iter_mut() {
                                             line.reset();
                                         }
                                     });
@@ -1989,20 +2004,26 @@ impl Application for App {
             }
             Message::FindNext => {
                 if !self.find_search_value.is_empty() {
-                    if let Some(Tab::Editor(tab)) = self.active_tab() {
-                        //TODO: do not compile find regex on every search?
-                        match self.config.find_regex(&self.find_search_value) {
-                            Ok(regex) => {
-                                tab.search(&regex, true, self.config.find_wrap_around);
+                    //TODO: do not compile find regex on every search?
+                    match self.config.find_regex(&self.find_search_value) {
+                        Ok(regex) => {
+                            let wrap_around = self.config.find_wrap_around;
+                            if let Some(Tab::Editor(tab)) = self.active_tab_mut()
+                                && tab.search(&regex, true, wrap_around)
+                            {
+                                // A match inside a folded region must
+                                // unfold to be seen (same rule as a
+                                // tree jump).
+                                tab.reveal_cursor_folds();
                             }
-                            Err(err) => {
-                                //TODO: put regex error in find box
-                                log::warn!(
-                                    "failed to compile regex {:?}: {}",
-                                    self.find_search_value,
-                                    err
-                                );
-                            }
+                        }
+                        Err(err) => {
+                            //TODO: put regex error in find box
+                            log::warn!(
+                                "failed to compile regex {:?}: {}",
+                                self.find_search_value,
+                                err
+                            );
                         }
                     }
                 }
@@ -2012,20 +2033,26 @@ impl Application for App {
             }
             Message::FindPrevious => {
                 if !self.find_search_value.is_empty() {
-                    if let Some(Tab::Editor(tab)) = self.active_tab() {
-                        //TODO: do not compile find regex on every search?
-                        match self.config.find_regex(&self.find_search_value) {
-                            Ok(regex) => {
-                                tab.search(&regex, false, self.config.find_wrap_around);
+                    //TODO: do not compile find regex on every search?
+                    match self.config.find_regex(&self.find_search_value) {
+                        Ok(regex) => {
+                            let wrap_around = self.config.find_wrap_around;
+                            if let Some(Tab::Editor(tab)) = self.active_tab_mut()
+                                && tab.search(&regex, false, wrap_around)
+                            {
+                                // A match inside a folded region must
+                                // unfold to be seen (same rule as a
+                                // tree jump).
+                                tab.reveal_cursor_folds();
                             }
-                            Err(err) => {
-                                //TODO: put regex error in find box
-                                log::warn!(
-                                    "failed to compile regex {:?}: {}",
-                                    self.find_search_value,
-                                    err
-                                );
-                            }
+                        }
+                        Err(err) => {
+                            //TODO: put regex error in find box
+                            log::warn!(
+                                "failed to compile regex {:?}: {}",
+                                self.find_search_value,
+                                err
+                            );
                         }
                     }
                 }
@@ -2743,8 +2770,11 @@ impl Application for App {
 
                     // Set selection end to highest possible value
                     let selection = editor.with_buffer(|buffer| {
-                        let last_line = buffer.lines.len().saturating_sub(1);
-                        let last_index = buffer.lines[last_line].text().len();
+                        let last_line = buffer.line_count().saturating_sub(1);
+                        let last_index = buffer
+                            .line_text_cow(last_line)
+                            .map(|text| text.len())
+                            .unwrap_or(0);
                         Selection::Normal(Cursor::new(last_line, last_index))
                     });
                     editor.set_selection(selection);
@@ -2917,9 +2947,14 @@ impl Application for App {
                 }
             }
             Message::TabSetCursor(entity, cursor) => {
-                if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity) {
-                    let mut editor = tab.editor.lock().unwrap();
-                    editor.set_cursor(cursor);
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    {
+                        let mut editor = tab.editor.lock().unwrap();
+                        editor.set_cursor(cursor);
+                    }
+                    // Search-result and project-search jumps land here; a
+                    // target inside a folded region must unfold to be seen.
+                    tab.reveal_cursor_folds();
                 }
             }
             Message::TabWidth(tab_width) => {
@@ -3057,6 +3092,16 @@ impl Application for App {
                     if let Some(view) = tab.json_view.as_mut() {
                         view.rebuild(&text);
                     }
+                    // Post-format hook: fold to the default level (2)
+                    // now that the ranges describe the formatted text.
+                    // Rope tabs stay unfolded — their buffer has no
+                    // hidden-line storage, so folds would be lies.
+                    if !tab.uses_rope_buffer() {
+                        if let Some(view) = tab.json_view.as_mut() {
+                            view.apply_default_fold_level();
+                        }
+                        tab.sync_folds();
+                    }
                     // Refresh the unsaved dot on the tab title.
                     let task = self.update(Message::TabChanged(entity));
                     // TabChanged just queued a redundant debounced
@@ -3072,6 +3117,47 @@ impl Application for App {
                     json_view.banner = false;
                 }
             }
+            Message::JsonFoldToggle(entity, line) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+                    && !tab.uses_rope_buffer()
+                    && tab
+                        .json_view
+                        .as_mut()
+                        .is_some_and(|view| view.fold.toggle(line))
+                {
+                    tab.sync_folds();
+                }
+            }
+            Message::JsonFoldAll => {
+                if let Some(Tab::Editor(tab)) = self.active_tab_mut()
+                    && !tab.uses_rope_buffer()
+                {
+                    if let Some(view) = tab.json_view.as_mut() {
+                        view.fold.fold_all();
+                    }
+                    tab.sync_folds();
+                }
+            }
+            Message::JsonUnfoldAll => {
+                if let Some(Tab::Editor(tab)) = self.active_tab_mut()
+                    && !tab.uses_rope_buffer()
+                {
+                    if let Some(view) = tab.json_view.as_mut() {
+                        view.fold.unfold_all();
+                    }
+                    tab.sync_folds();
+                }
+            }
+            Message::JsonFoldLevel(level) => {
+                if let Some(Tab::Editor(tab)) = self.active_tab_mut()
+                    && !tab.uses_rope_buffer()
+                {
+                    if let Some(view) = tab.json_view.as_mut() {
+                        view.fold.fold_level(level);
+                    }
+                    tab.sync_folds();
+                }
+            }
             Message::JsonTreeToggle(entity, node_id) => {
                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
                     && let Some(view) = tab.json_view.as_mut()
@@ -3081,6 +3167,24 @@ impl Application for App {
             }
             Message::JsonTreeJump(entity, node_id) => {
                 if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    // Jump into a folded region auto-unfolds its ancestors
+                    // (the fold and tree axes stay independent otherwise) —
+                    // the target row must be visible before the cursor and
+                    // scroll land on it.
+                    let node_line = tab
+                        .json_view
+                        .as_ref()
+                        .and_then(|view| view.node(node_id))
+                        .map(|node| node.line);
+                    if let Some(line) = node_line
+                        && !tab.uses_rope_buffer()
+                        && tab
+                            .json_view
+                            .as_mut()
+                            .is_some_and(|view| view.fold.unfold_lines_containing(line))
+                    {
+                        tab.sync_folds();
+                    }
                     let line_count = tab.total_line_count();
                     let target = tab.json_view.as_ref().and_then(|view| {
                         if line_count == view.aligned_line_count() {
@@ -3189,6 +3293,11 @@ impl Application for App {
                         if let Some(view) = tab.json_view.as_mut() {
                             view.rebuild(&text);
                         }
+                        // The re-parse shifted the fold ranges' line
+                        // space; the buffer's hidden flags moved with
+                        // their lines and are the ground truth for
+                        // what stays folded.
+                        tab.resync_folds_from_buffer();
                     }
                 }
             }
@@ -3264,12 +3373,25 @@ impl Application for App {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
+        // Fold commands show only for a foldable active tab: a JSON
+        // document with at least one range, on a Full-backed buffer (the
+        // rope arm cannot hide lines).
+        let json_fold_active = match self.active_tab() {
+            Some(Tab::Editor(tab)) => {
+                tab.json_view
+                    .as_ref()
+                    .is_some_and(|view| view.fold.has_ranges())
+                    && !tab.uses_rope_buffer()
+            }
+            _ => false,
+        };
         vec![menu_bar(
             &self.core,
             &self.config,
             &self.config_state,
             &self.key_binds,
             &self.projects,
+            json_fold_active,
         )]
     }
 
@@ -3337,6 +3459,28 @@ impl Application for App {
                 // the pane is showing.
                 let json_tree_active = tab.json_view.as_ref().is_some_and(|view| view.has_tree());
 
+                // Fold gutter data: only Full-backed buffers can hide lines
+                // (the rope arm's hidden flag is inert), and only documents
+                // with at least one foldable range need the band.
+                let json_fold = if tab.uses_rope_buffer() {
+                    None
+                } else {
+                    tab.json_view
+                        .as_ref()
+                        .filter(|view| view.fold.has_ranges())
+                        .map(|view| {
+                            let markers: std::collections::HashMap<u32, bool> = view
+                                .fold
+                                .ranges
+                                .iter()
+                                .map(|range| {
+                                    (range.start_line, view.fold.is_folded(range.start_line))
+                                })
+                                .collect();
+                            (markers, view.aligned_line_count())
+                        })
+                };
+
                 let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
                     .id(self.text_box_id.clone())
                     .on_focus(Message::FindFocused(false))
@@ -3354,6 +3498,11 @@ impl Application for App {
                 }
                 if self.config.line_numbers {
                     text_box = text_box.line_numbers();
+                }
+                if let Some((markers, parsed_lines)) = json_fold {
+                    text_box = text_box.fold_gutter(markers, parsed_lines, move |line| {
+                        Message::JsonFoldToggle(tab_id, line)
+                    });
                 }
                 let mut popover = widget::popover(text_box);
                 if let Some(point) = tab.context_menu {

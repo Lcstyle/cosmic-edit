@@ -130,3 +130,6 @@ json-tree-copy-path = Copy path
 json-tree-copy-value = Copy value
 json-tree-more = … { $count } more rows
 json-tree-truncated = { $count } nodes beyond the tree budget
+json-fold-all = Fold All
+json-unfold-all = Unfold All
+json-fold-level = Fold Level { $level }
