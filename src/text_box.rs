@@ -48,6 +48,7 @@ pub struct TextBox<'a, Message> {
     padding: Padding,
     on_auto_scroll: Option<Box<dyn Fn(Option<f32>) -> Message + 'a>>,
     on_changed: Option<Message>,
+    on_cursor_move: Option<Message>,
     on_focus: Option<Message>,
     click_timing: Duration,
     has_context_menu: bool,
@@ -68,6 +69,7 @@ where
             padding: Padding::new(0.0),
             on_auto_scroll: None,
             on_changed: None,
+            on_cursor_move: None,
             on_focus: None,
             click_timing: Duration::from_millis(500),
             has_context_menu: false,
@@ -94,6 +96,15 @@ where
 
     pub fn on_changed(mut self, on_changed: Message) -> Self {
         self.on_changed = Some(on_changed);
+        self
+    }
+
+    /// Published whenever the editor cursor lands somewhere new — key
+    /// motion, click, edit, vi motion alike. Fires at most once per
+    /// processed event, only on actual movement, so it rides the existing
+    /// redraw cadence rather than adding one.
+    pub fn on_cursor_move(mut self, on_cursor_move: Message) -> Self {
+        self.on_cursor_move = Some(on_cursor_move);
         self
     }
 
@@ -1403,6 +1414,14 @@ where
             _ => (),
         }
 
+        if let Some(on_cursor_move) = &self.on_cursor_move {
+            let cursor = editor.cursor();
+            if state.last_cursor != Some(cursor) {
+                state.last_cursor = Some(cursor);
+                shell.publish(on_cursor_move.clone());
+            }
+        }
+
         if let Some(on_changed) = &self.on_changed {
             //TODO: better handling of status line update
             let parser = editor.parser();
@@ -1451,6 +1470,8 @@ pub struct State {
     shift_anchor: Mutex<Option<Cursor>>,
     caret_position: (i32, i32),
     preedit: Option<Preedit>,
+    /// Last cursor reported through `on_cursor_move`; movement edge detector.
+    last_cursor: Option<Cursor>,
 }
 
 impl State {
@@ -1470,6 +1491,7 @@ impl State {
             shift_anchor: Mutex::new(None),
             caret_position: (0, 0),
             preedit: None,
+            last_cursor: None,
         }
     }
 }

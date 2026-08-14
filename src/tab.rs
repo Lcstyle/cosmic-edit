@@ -15,7 +15,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{Config, SYNTAX_SYSTEM, fl, git::GitDiff};
+use crate::{Config, SYNTAX_SYSTEM, fl, git::GitDiff, json_scan, json_tree::JsonViewState};
+
+/// Indent used by the JSON Format command.
+const JSON_FORMAT_INDENT: &str = "  ";
 
 fn editor_text(editor: &ViEditor<'static, 'static>) -> String {
     editor.with_buffer(|buffer| {
@@ -53,6 +56,8 @@ pub struct EditorTab {
     pub editor: Mutex<ViEditor<'static, 'static>>,
     pub context_menu: Option<Point>,
     pub zoom_adj: i8,
+    /// JSON support state; `Some` when this tab holds a `.json` document.
+    pub json_view: Option<JsonViewState>,
 }
 
 impl EditorTab {
@@ -77,6 +82,7 @@ impl EditorTab {
             editor: Mutex::new(ViEditor::new(editor)),
             context_menu: None,
             zoom_adj,
+            json_view: None,
         };
 
         // Update any other config settings
@@ -104,9 +110,6 @@ impl EditorTab {
     }
 
     pub fn open(&mut self, path: PathBuf) {
-        let mut editor = self.editor.lock().unwrap();
-        let mut font_system = font_system().write().unwrap();
-        let mut editor = editor.borrow_with(font_system.raw());
         let absolute = match fs::canonicalize(&path) {
             Ok(ok) => ok,
             Err(err) => match path::absolute(&path) {
@@ -117,22 +120,182 @@ impl EditorTab {
                 }
             },
         };
-        match editor.load_text(&absolute, self.attrs.clone()) {
-            Ok(()) => {
-                log::info!("opened {:?}", absolute);
-                self.path_opt = Some(absolute);
-            }
-            Err(err) => {
-                if err.kind() == io::ErrorKind::NotFound {
-                    log::warn!("opened non-existant file {:?}", absolute);
+        let byte_len = fs::metadata(&absolute).map(|meta| meta.len()).unwrap_or(0);
+        // Scoped so the editor lock is released before the minified-JSON
+        // check below re-locks it.
+        {
+            let mut editor = self.editor.lock().unwrap();
+            let mut font_system = font_system().write().unwrap();
+            let mut editor = editor.borrow_with(font_system.raw());
+            match editor.load_text(&absolute, self.attrs.clone()) {
+                Ok(()) => {
+                    log::info!("opened {:?}", absolute);
                     self.path_opt = Some(absolute);
-                    editor.set_changed(true);
-                } else {
-                    log::error!("failed to open {:?}: {}", absolute, err);
-                    self.path_opt = None;
+                }
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::NotFound {
+                        log::warn!("opened non-existant file {:?}", absolute);
+                        self.path_opt = Some(absolute);
+                        editor.set_changed(true);
+                    } else {
+                        log::error!("failed to open {:?}: {}", absolute, err);
+                        self.path_opt = None;
+                    }
                 }
             }
         }
+
+        self.detect_minified_json(byte_len);
+    }
+
+    /// JSON support setup, run when a document is (re)loaded: builds the
+    /// per-tab [`JsonViewState`] (the cached span AST behind the tree pane)
+    /// for every `.json` document, and raises the one-time Format banner
+    /// when the document is minified — essentially unlined (≤3 lines
+    /// carrying >4KiB).
+    ///
+    /// `byte_len` is the total document size; the caller already knows it
+    /// (file metadata at open) so it is not recomputed from the buffer.
+    ///
+    /// Known cost: the AST build walks the whole document once at load
+    /// (`text()` is linear, the parse is node-budgeted).
+    pub fn detect_minified_json(&mut self, byte_len: u64) {
+        const MINIFIED_MIN_BYTES: u64 = 4096;
+        const MINIFIED_MAX_LINES: usize = 3;
+
+        if !self.is_json() {
+            self.json_view = None;
+            return;
+        }
+        let minified = {
+            let editor = self.editor.lock().unwrap();
+            editor.with_buffer(|buffer| {
+                buffer.lines.len() <= MINIFIED_MAX_LINES && byte_len > MINIFIED_MIN_BYTES
+            })
+        };
+        self.json_view = Some(JsonViewState::from_text(&self.text(), minified));
+    }
+
+    /// Map an absolute byte offset to a buffer cursor by walking the
+    /// buffer's own lines. This is the fallback for documents whose buffer
+    /// lines do not correspond 1:1 to source lines — O(lines) and used for
+    /// one-shot jumps only. Offsets landing inside a line ending clamp to
+    /// the end of that line's text.
+    pub fn cursor_for_byte_offset(&self, offset: usize) -> (usize, usize) {
+        let editor = self.editor.lock().unwrap();
+        editor.with_buffer(|buffer| {
+            let mut start = 0;
+            let count = buffer.lines.len();
+            for i in 0..count {
+                let text_len = buffer.lines.get(i).map(|line| line.text().len()).unwrap_or(0);
+                let ending_len = buffer
+                    .lines
+                    .get(i)
+                    .map(|line| line.ending().as_str().len())
+                    .unwrap_or(0);
+                if offset < start + text_len + ending_len || i + 1 == count {
+                    return (i, offset.saturating_sub(start).min(text_len));
+                }
+                start += text_len + ending_len;
+            }
+            (0, 0)
+        })
+    }
+
+    /// The full document text (lines joined with their endings).
+    pub fn text(&self) -> String {
+        let editor = self.editor.lock().unwrap();
+        editor_text(&editor)
+    }
+
+    /// Number of lines the buffer holds.
+    pub fn total_line_count(&self) -> usize {
+        let editor = self.editor.lock().unwrap();
+        editor.with_buffer(|buffer| buffer.lines.len())
+    }
+
+    /// Set the cursor position (clamped to valid range).
+    pub fn set_cursor(&mut self, line: usize, index: usize) {
+        let mut editor = self.editor.lock().unwrap();
+        let cursor = editor.with_buffer(|buffer| {
+            let line = line.min(buffer.lines.len().saturating_sub(1));
+            let index = index.min(
+                buffer
+                    .lines
+                    .get(line)
+                    .map(|l| l.text().len())
+                    .unwrap_or(0),
+            );
+            Cursor::new(line, index)
+        });
+        editor.set_cursor(cursor);
+        editor.set_selection(Selection::None);
+    }
+
+    /// Rewrite the document through [`json_scan::pretty_print`] as ONE
+    /// undoable edit: a single change record covering the select-all delete
+    /// plus the insert of the formatted text, so a single undo restores the
+    /// original bytes exactly. Malformed JSON is refused — `pretty_print`
+    /// returns `None` and the buffer is left untouched.
+    ///
+    /// Returns true when the buffer was modified.
+    pub fn format_json(&mut self) -> bool {
+        let text = self.text();
+        let Some(formatted) = json_scan::pretty_print(&text, JSON_FORMAT_INDENT) else {
+            log::warn!(
+                "json format: refused (parse error or pathological nesting), leaving the document untouched"
+            );
+            return false;
+        };
+        if formatted == text {
+            // Already formatted: nothing to rewrite, nothing to undo. The
+            // banner's offer is fulfilled either way.
+            if let Some(json_view) = &mut self.json_view {
+                json_view.banner = false;
+            }
+            return false;
+        }
+        {
+            let mut editor = self.editor.lock().unwrap();
+
+            // Store the entire operation as a single change for undo
+            editor.start_change();
+
+            // Grab everything in the buffer (same select-all shape as reload)
+            let cursor_start = Cursor::new(0, 0);
+            let cursor_end = editor.with_buffer(|buffer| {
+                let last_line = buffer.lines.len().saturating_sub(1);
+                Cursor::new(
+                    last_line,
+                    buffer
+                        .lines
+                        .get(last_line)
+                        .map(|line| line.text().len())
+                        .unwrap_or(0),
+                )
+            });
+            editor.delete_range(cursor_start, cursor_end);
+            editor.insert_at(cursor_start, &formatted, None);
+
+            // Land at the top of the newly formatted document
+            editor.set_cursor(cursor_start);
+            editor.set_selection(Selection::None);
+
+            editor.finish_change();
+        }
+        if let Some(json_view) = &mut self.json_view {
+            json_view.banner = false;
+        }
+        true
+    }
+
+    /// Check if this tab contains a JSON file.
+    pub fn is_json(&self) -> bool {
+        self.path_opt
+            .as_ref()
+            .and_then(|p| p.extension())
+            .map(|ext| ext == "json")
+            .unwrap_or(false)
     }
 
     pub fn reload(&mut self) {

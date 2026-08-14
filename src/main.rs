@@ -25,7 +25,7 @@ use cosmic_files::{
     dialog::{Dialog, DialogKind, DialogMessage, DialogResult, DialogSettings},
     mime_icon::{mime_for_path, mime_icon},
 };
-use cosmic_text::{Cursor, Edit, Family, Selection, SwashCache, SyntaxSystem, ViMode};
+use cosmic_text::{Cursor, Edit, Family, Scroll, Selection, SwashCache, SyntaxSystem, ViMode};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
@@ -44,6 +44,8 @@ use config::{AppTheme, CONFIG_VERSION, Config, ConfigState};
 mod config;
 
 mod json_scan;
+mod json_tree;
+
 use git::{GitDiff, GitDiffLine, GitRepository, GitStatus, GitStatusKind};
 mod git;
 
@@ -77,6 +79,9 @@ static ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
 static LINE_NUMBER_CACHE: OnceLock<Mutex<LineNumberCache>> = OnceLock::new();
 static SWASH_CACHE: OnceLock<Mutex<SwashCache>> = OnceLock::new();
 static SYNTAX_SYSTEM: OnceLock<SyntaxSystem> = OnceLock::new();
+
+/// Quiet period between the last edit and the JSON tree-pane rebuild.
+const JSON_TREE_REBUILD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 
 pub fn icon_cache_get(name: &'static str, size: u16) -> icon::Icon {
     let mut icon_cache = ICON_CACHE.get().unwrap().lock().unwrap();
@@ -367,6 +372,25 @@ pub enum Message {
     GitProjectStatus(Vec<(String, PathBuf, Vec<GitStatus>)>),
     GitStage(PathBuf, PathBuf),
     GitUnstage(PathBuf, PathBuf),
+    // JSON support messages
+    /// Pretty-print the tab's JSON document as one undoable edit.
+    JsonFormat(segmented_button::Entity),
+    /// Dismiss the minified-JSON banner without formatting.
+    JsonBannerDismiss(segmented_button::Entity),
+    /// Tree pane: toggle a node's expansion (chevron click).
+    JsonTreeToggle(segmented_button::Entity, json_tree::NodeId),
+    /// Tree pane: jump the editor cursor to a node's value (row click).
+    JsonTreeJump(segmented_button::Entity, json_tree::NodeId),
+    /// Tree pane: filter box edited (empty string clears).
+    JsonTreeFilter(segmented_button::Entity, String),
+    /// Tree pane: a row was right-pressed; arms the row context menu.
+    JsonTreeRowContext(segmented_button::Entity, json_tree::NodeId),
+    /// Tree pane context menu: copy the node's JSON path.
+    JsonTreeCopyPath(segmented_button::Entity, json_tree::NodeId),
+    /// Tree pane context menu: copy the node's raw value text.
+    JsonTreeCopyValue(segmented_button::Entity, json_tree::NodeId),
+    /// Debounce tick: rebuild trees whose quiet period elapsed.
+    JsonTreeRebuildTick,
     Key(Modifiers, keyboard::key::Physical, keyboard::Key),
     LaunchUrl(String),
     Modifiers(Modifiers),
@@ -411,6 +435,9 @@ pub enum Message {
     TabCloseForce(segmented_button::Entity),
     TabContextAction(segmented_button::Entity, Action),
     TabContextMenu(segmented_button::Entity, Option<Point>),
+    /// The editor cursor landed somewhere new (only wired while a JSON
+    /// tree pane is showing) — drives follow-cursor.
+    TabCursorMoved(segmented_button::Entity),
     TabNext,
     TabPrev,
     TabSetCursor(segmented_button::Entity, Cursor),
@@ -468,6 +495,12 @@ pub struct App {
     theme_names: Vec<String>,
     context_page: ContextPage,
     text_box_id: widget::Id,
+    /// Scrollable ID for the JSON tree pane (only the active tab renders one)
+    json_tree_scroll_id: widget::Id,
+    /// JSON tabs with a pending tree rebuild: entity -> due time. Filled on
+    /// edits, drained by the debounce tick so the tree never rebuilds per
+    /// keystroke.
+    json_tree_rebuilds: HashMap<Entity, std::time::Instant>,
     auto_scroll: Option<(f32, u32)>,
     dialog_opt: Option<Dialog<Message>>,
     dialog_page_opt: Option<DialogPage>,
@@ -502,6 +535,18 @@ impl App {
 
     pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
         self.tab_model.active_data_mut()
+    }
+
+    /// Queue a debounced JSON tree rebuild for `entity` if it is a JSON tab.
+    /// The subscription tick drains the queue once the quiet period passes,
+    /// so rapid typing costs one rebuild, not one per keystroke.
+    fn schedule_json_tree_rebuild(&mut self, entity: Entity) {
+        if let Some(Tab::Editor(tab)) = self.tab_model.data::<Tab>(entity)
+            && tab.json_view.is_some()
+        {
+            self.json_tree_rebuilds
+                .insert(entity, std::time::Instant::now() + JSON_TREE_REBUILD_DEBOUNCE);
+        }
     }
 
     fn open_folder<P: AsRef<Path>>(&mut self, path: P, mut position: u16, indent: u16) {
@@ -1487,6 +1532,8 @@ impl Application for App {
             theme_names,
             context_page: ContextPage::Settings,
             text_box_id: widget::Id::unique(),
+            json_tree_scroll_id: widget::Id::unique(),
+            json_tree_rebuilds: HashMap::new(),
             auto_scroll: None,
             dialog_opt: None,
             dialog_page_opt: None,
@@ -1588,6 +1635,13 @@ impl Application for App {
         } else if self.find_opt.is_some() {
             // Close find if open
             self.find_opt = None;
+        } else if let Some(Tab::Editor(tab)) = self.active_tab_mut() {
+            // Clear the JSON tree pane's filter if one is active
+            if let Some(view) = tab.json_view.as_mut()
+                && !view.filter.is_empty()
+            {
+                view.clear_filter();
+            }
         }
 
         // Focus correct widget
@@ -2760,6 +2814,10 @@ impl Application for App {
                     }
                     self.tab_model.text_set(entity, title);
                 }
+                // Changed-state transitions come from edits made outside the
+                // text box too (undo, cut, revert) — debounce a JSON tree
+                // rebuild so the pane follows the buffer.
+                self.schedule_json_tree_rebuild(entity);
             }
             Message::TabClose(entity) => {
                 match self.tab_model.data_mut::<Tab>(entity) {
@@ -2988,6 +3046,184 @@ impl Application for App {
                     }
                 }
             }
+            // JSON support messages
+            Message::JsonFormat(entity) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+                    && tab.format_json()
+                {
+                    // The buffer was rewritten wholesale; rebuild the
+                    // tree pane against the formatted text right away.
+                    let text = tab.text();
+                    if let Some(view) = tab.json_view.as_mut() {
+                        view.rebuild(&text);
+                    }
+                    // Refresh the unsaved dot on the tab title.
+                    let task = self.update(Message::TabChanged(entity));
+                    // TabChanged just queued a redundant debounced
+                    // rebuild of the tree rebuilt above — cancel it.
+                    self.json_tree_rebuilds.remove(&entity);
+                    return task;
+                }
+            }
+            Message::JsonBannerDismiss(entity) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+                    && let Some(json_view) = &mut tab.json_view
+                {
+                    json_view.banner = false;
+                }
+            }
+            Message::JsonTreeToggle(entity, node_id) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+                    && let Some(view) = tab.json_view.as_mut()
+                {
+                    view.toggle_expanded(node_id);
+                }
+            }
+            Message::JsonTreeJump(entity, node_id) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    let line_count = tab.total_line_count();
+                    let target = tab.json_view.as_ref().and_then(|view| {
+                        if line_count == view.aligned_line_count() {
+                            view.jump_target(node_id)
+                        } else {
+                            // Buffer lines are not 1:1 with source lines:
+                            // walk the buffer to the node's byte offset
+                            // instead.
+                            let (offset, _len) = view.node_span(node_id)?;
+                            Some(tab.cursor_for_byte_offset(offset))
+                        }
+                    });
+                    if let Some((line, col)) = target {
+                        tab.set_cursor(line, col);
+                        // Center the target line in the viewport. The next
+                        // cursor-driven reshape keeps a scroll that already
+                        // has the cursor visible, so centering sticks.
+                        {
+                            let mut editor = tab.editor.lock().unwrap();
+                            editor.with_buffer_mut(|buffer| {
+                                let line_height = buffer.metrics().line_height.max(1.0);
+                                let visible = buffer
+                                    .size()
+                                    .1
+                                    .map(|h| (h / line_height) as usize)
+                                    .unwrap_or(20);
+                                buffer.set_scroll(Scroll::new(
+                                    line.saturating_sub(visible / 2),
+                                    0.0,
+                                    0.0,
+                                ));
+                            });
+                        }
+                        if let Some(view) = tab.json_view.as_mut() {
+                            view.selected = Some(node_id);
+                            view.context_node = None;
+                        }
+                        // Hand focus to the editor at the jump target.
+                        return widget::text_input::focus(self.text_box_id.clone());
+                    }
+                }
+            }
+            Message::JsonTreeFilter(entity, value) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+                    && let Some(view) = tab.json_view.as_mut()
+                {
+                    view.set_filter(value);
+                }
+            }
+            Message::JsonTreeRowContext(entity, node_id) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+                    && let Some(view) = tab.json_view.as_mut()
+                {
+                    view.context_node = Some(node_id);
+                }
+            }
+            Message::JsonTreeCopyPath(entity, node_id) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    let path = tab
+                        .json_view
+                        .as_ref()
+                        .and_then(|view| view.path_to(node_id))
+                        .map(|chain| json_scan::json_path(&chain));
+                    if let Some(view) = tab.json_view.as_mut() {
+                        view.context_node = None;
+                    }
+                    if let Some(path) = path {
+                        return clipboard::write(path);
+                    }
+                }
+            }
+            Message::JsonTreeCopyValue(entity, node_id) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    let span = tab
+                        .json_view
+                        .as_ref()
+                        .and_then(|view| view.node_span(node_id));
+                    if let Some(view) = tab.json_view.as_mut() {
+                        view.context_node = None;
+                    }
+                    if let Some((offset, len)) = span {
+                        // Slice defensively: during the rebuild debounce
+                        // window the buffer may have drifted from the text
+                        // the span was parsed from.
+                        let text = tab.text();
+                        if let Some(value) = text.get(offset..offset + len) {
+                            return clipboard::write(value.to_string());
+                        }
+                    }
+                }
+            }
+            Message::JsonTreeRebuildTick => {
+                let now = std::time::Instant::now();
+                let due: Vec<Entity> = self
+                    .json_tree_rebuilds
+                    .iter()
+                    .filter(|(_, at)| **at <= now)
+                    .map(|(entity, _)| *entity)
+                    .collect();
+                for entity in due {
+                    self.json_tree_rebuilds.remove(&entity);
+                    if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity)
+                        && tab.json_view.is_some()
+                    {
+                        let text = tab.text();
+                        if let Some(view) = tab.json_view.as_mut() {
+                            view.rebuild(&text);
+                        }
+                    }
+                }
+            }
+            Message::TabCursorMoved(entity) => {
+                if let Some(Tab::Editor(tab)) = self.tab_model.data_mut::<Tab>(entity) {
+                    let cursor = {
+                        let editor = tab.editor.lock().unwrap();
+                        editor.cursor()
+                    };
+                    let line_count = tab.total_line_count();
+                    if let Some(view) = tab.json_view.as_mut() {
+                        // Follow only while the buffer's lines are 1:1 with
+                        // the parsed text; the resolve is a span walk, the
+                        // tree itself only rebuilds on buffer changes.
+                        if view.has_tree()
+                            && line_count == view.aligned_line_count()
+                            && let Some(offset) =
+                                view.offset_for_position(cursor.line, cursor.index)
+                            && let Some(row_index) = view.follow_offset(offset)
+                        {
+                            // Keep the selected row in view, a few
+                            // rows down from the pane top.
+                            let y = row_index.saturating_sub(3) as f32
+                                * json_tree::TREE_ROW_HEIGHT;
+                            return iced::widget::scrollable::scroll_to(
+                                self.json_tree_scroll_id.clone(),
+                                iced::widget::scrollable::AbsoluteOffset {
+                                    x: None,
+                                    y: Some(y),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         Task::none()
@@ -3073,6 +3309,34 @@ impl Application for App {
         let tab_id = self.tab_model.active();
         match self.tab_model.data::<Tab>(tab_id) {
             Some(Tab::Editor(tab)) => {
+                // One-time banner on minified JSON files: offer Format, allow
+                // dismiss. Styled like the find bar row below.
+                if tab.json_view.as_ref().is_some_and(|v| v.banner) {
+                    let banner_row = widget::row::with_children(vec![
+                        widget::text::body(fl!("json-minified-banner")).into(),
+                        widget::space::horizontal().into(),
+                        widget::button::suggested(fl!("json-format"))
+                            .on_press(Message::JsonFormat(tab_id))
+                            .into(),
+                        button::custom(icon_cache_get("window-close-symbolic", 16))
+                            .on_press(Message::JsonBannerDismiss(tab_id))
+                            .padding(space_xxs)
+                            .class(style::Button::Icon)
+                            .into(),
+                    ])
+                    .align_y(Alignment::Center)
+                    .padding(space_xxs)
+                    .spacing(space_xxs);
+                    tab_column = tab_column.push(
+                        widget::layer_container(banner_row).layer(cosmic_theme::Layer::Primary),
+                    );
+                }
+
+                // JSON documents with a parsed root get the tree pane in a
+                // split view; the follow-cursor plumbing only exists while
+                // the pane is showing.
+                let json_tree_active = tab.json_view.as_ref().is_some_and(|view| view.has_tree());
+
                 let mut text_box = text_box(&tab.editor, self.config.metrics(tab.zoom_adj()))
                     .id(self.text_box_id.clone())
                     .on_focus(Message::FindFocused(false))
@@ -3082,6 +3346,9 @@ impl Application for App {
                     .on_context_menu(move |position_opt| {
                         Message::TabContextMenu(tab_id, position_opt)
                     });
+                if json_tree_active {
+                    text_box = text_box.on_cursor_move(Message::TabCursorMoved(tab_id));
+                }
                 if self.config.highlight_current_line {
                     text_box = text_box.highlight_current_line();
                 }
@@ -3094,7 +3361,35 @@ impl Application for App {
                         .popup(menu::context_menu(&self.key_binds, tab_id))
                         .position(widget::popover::Position::Point(point));
                 }
-                tab_column = tab_column.push(popover);
+                match tab.json_view.as_ref().filter(|view| view.has_tree()) {
+                    Some(state) => {
+                        // JSON split view: editor left, tree pane right.
+                        let pane = json_tree::tree_pane(
+                            state,
+                            tab_id,
+                            self.json_tree_scroll_id.clone(),
+                        );
+                        // One context-menu wrapper for the whole pane: a row
+                        // right-press arms it with that row's items before
+                        // the menu opens on the release (same deferred-items
+                        // pattern as the editor's context menu).
+                        let pane = widget::context_menu(
+                            pane,
+                            state
+                                .context_node
+                                .map(|id| json_tree::context_menu_items(tab_id, id)),
+                        );
+                        let split_view = widget::row::with_capacity(3)
+                            .push(widget::container(popover).width(Length::FillPortion(2)))
+                            .push(widget::divider::vertical::light())
+                            .push(widget::container(pane).width(Length::FillPortion(1)))
+                            .spacing(4);
+                        tab_column = tab_column.push(split_view);
+                    }
+                    None => {
+                        tab_column = tab_column.push(popover);
+                    }
+                }
                 if self.config.vim_bindings {
                     let status = {
                         let editor = tab.editor.lock().unwrap();
@@ -3477,6 +3772,14 @@ impl Application for App {
                         counter: auto_scroll.1,
                     })
                     .map(move |(auto_scroll, _)| Message::Scroll(auto_scroll.auto_scroll)),
+            );
+        }
+
+        // Debounce timer for JSON tree rebuilds; same pattern as above.
+        if !self.json_tree_rebuilds.is_empty() {
+            subscriptions.push(
+                iced::time::every(time::Duration::from_millis(100))
+                    .map(|_| Message::JsonTreeRebuildTick),
             );
         }
 

@@ -53,6 +53,11 @@ pub struct FoldRange {
     pub start_line: u32,
     pub end_line: u32,
     pub kind: FoldKind,
+    /// 1-based nesting depth of the container: the root container is 1, a
+    /// container directly inside it is 2, and so on — the open-stack height
+    /// when this range's brace was pushed. "Fold level N" folds every range
+    /// with `depth >= N`.
+    pub depth: u32,
 }
 
 /// Tokenize `text`, tolerating any malformed input without panicking.
@@ -186,12 +191,12 @@ impl Scanner<'_> {
                 && self.bytes().get(self.pos + 1) == Some(&b'u')
             {
                 self.pos += 2;
-                if let Some(low) = self.scan_hex4() {
-                    if (0xDC00..=0xDFFF).contains(&low) {
-                        let combined = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
-                        if let Some(ch) = char::from_u32(combined) {
-                            return ch;
-                        }
+                if let Some(low) = self.scan_hex4()
+                    && (0xDC00..=0xDFFF).contains(&low)
+                {
+                    let combined = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                    if let Some(ch) = char::from_u32(combined) {
+                        return ch;
                     }
                 }
                 self.pos = saved;
@@ -313,6 +318,7 @@ pub fn fold_ranges(text: &str) -> Vec<FoldRange> {
     struct Open {
         start_line: u32,
         kind: FoldKind,
+        depth: u32,
     }
     let mut stack: Vec<Open> = Vec::new();
     let mut ranges = Vec::new();
@@ -323,6 +329,7 @@ pub fn fold_ranges(text: &str) -> Vec<FoldRange> {
                 stack.push(Open {
                     start_line: spanned.line,
                     kind: FoldKind::Object,
+                    depth: stack.len() as u32 + 1,
                 });
                 continue;
             }
@@ -330,6 +337,7 @@ pub fn fold_ranges(text: &str) -> Vec<FoldRange> {
                 stack.push(Open {
                     start_line: spanned.line,
                     kind: FoldKind::Array,
+                    depth: stack.len() as u32 + 1,
                 });
                 continue;
             }
@@ -337,16 +345,17 @@ pub fn fold_ranges(text: &str) -> Vec<FoldRange> {
             JsonToken::CloseBracket => FoldKind::Array,
             _ => continue,
         };
-        if stack.last().is_some_and(|open| open.kind == kind) {
-            let open = stack.pop().expect("just checked non-empty");
-            if spanned.line > open.start_line + 1 && prev_start != Some(open.start_line) {
-                ranges.push(FoldRange {
-                    start_line: open.start_line,
-                    end_line: spanned.line - 1,
-                    kind,
-                });
-                prev_start = Some(open.start_line);
-            }
+        if let Some(open) = stack.pop_if(|open| open.kind == kind)
+            && spanned.line > open.start_line + 1
+            && prev_start != Some(open.start_line)
+        {
+            ranges.push(FoldRange {
+                start_line: open.start_line,
+                end_line: spanned.line - 1,
+                kind,
+                depth: open.depth,
+            });
+            prev_start = Some(open.start_line);
         }
     }
     ranges.sort_unstable_by_key(|range| (range.start_line, std::cmp::Reverse(range.end_line)));
@@ -362,6 +371,20 @@ pub const DEFAULT_NODE_BUDGET: usize = 100_000;
 /// [`JsonTree::truncated`]) so descent recursion cannot overflow the stack
 /// on adversarial input like `[[[[…`.
 const MAX_DEPTH: usize = 200;
+
+/// Output cap for [`pretty_print`], as a multiple of the input length.
+/// Real documents expand well under 3× (per-token newline plus shallow
+/// indentation); past 10× the input is pathologically nested — and for
+/// *unclosed* nesting the parse error only surfaces at EOF, after the
+/// per-line indentation has already grown quadratically (a 100KB file of
+/// `[` builds ~10GB before returning `None`). The cap turns that into a
+/// linear-time refusal.
+const PRETTY_PRINT_MAX_GROWTH: usize = 10;
+
+/// Floor for the output cap: on small inputs legitimate deep nesting
+/// dominates the multiplier (a 1KB document nested 500 deep formats to
+/// ~500KB), so tiny inputs get a fixed allowance instead.
+const PRETTY_PRINT_MIN_CAP: usize = 4 << 20;
 
 /// Character cap for scalar previews shown in the tree pane.
 const PREVIEW_MAX_CHARS: usize = 40;
@@ -487,8 +510,17 @@ fn is_path_ident(key: &str) -> bool {
 ///
 /// Returns `None` for anything that does not parse cleanly as a single
 /// JSON value — formatting must never drop or invent content, so a
-/// malformed document is left untouched rather than "repaired".
+/// malformed document is left untouched rather than "repaired". Also
+/// returns `None` when the output exceeds its cap
+/// ([`PRETTY_PRINT_MAX_GROWTH`] × the input, [`PRETTY_PRINT_MIN_CAP`]
+/// floor): nesting deep enough to trip it is pathological whether or not
+/// it eventually closes, and unclosed nesting would otherwise balloon
+/// quadratic indentation before EOF reveals the parse error.
 pub fn pretty_print(text: &str, indent: &str) -> Option<String> {
+    let cap = text
+        .len()
+        .saturating_mul(PRETTY_PRINT_MAX_GROWTH)
+        .max(PRETTY_PRINT_MIN_CAP);
     let mut out = String::with_capacity(text.len() + text.len() / 3);
     let mut stack: Vec<FoldKind> = Vec::new();
     let mut expect = PrintExpect::Value {
@@ -496,6 +528,9 @@ pub fn pretty_print(text: &str, indent: &str) -> Option<String> {
         empty_array_ok: false,
     };
     for spanned in scan(text) {
+        if out.len() > cap {
+            return None;
+        }
         let raw = &text[spanned.offset..spanned.offset + spanned.len];
         expect = match expect {
             PrintExpect::Value {
@@ -919,11 +954,12 @@ mod tests {
         }
     }
 
-    fn fr(start_line: u32, end_line: u32, kind: FoldKind) -> FoldRange {
+    fn fr(start_line: u32, end_line: u32, kind: FoldKind, depth: u32) -> FoldRange {
         FoldRange {
             start_line,
             end_line,
             kind,
+            depth,
         }
     }
 
@@ -1013,9 +1049,9 @@ mod tests {
         assert_eq!(
             fold_ranges(NESTED),
             vec![
-                fr(0, 7, FoldKind::Object),
-                fr(1, 6, FoldKind::Object),
-                fr(2, 4, FoldKind::Array),
+                fr(0, 7, FoldKind::Object, 1),
+                fr(1, 6, FoldKind::Object, 2),
+                fr(2, 4, FoldKind::Array, 3),
             ]
         );
     }
@@ -1032,7 +1068,7 @@ mod tests {
         // Outer object never closes; the closed inner object still folds.
         assert_eq!(
             fold_ranges("{\n  \"a\": {\n    \"b\": 1\n  }\n"),
-            vec![fr(1, 2, FoldKind::Object)]
+            vec![fr(1, 2, FoldKind::Object, 2)]
         );
         // Nothing closes: no ranges, no panic.
         assert_eq!(fold_ranges("{\n\"a\": [1,\n2\n"), vec![]);
@@ -1052,7 +1088,7 @@ mod tests {
         // (innermost) range survives the prevStart check.
         assert_eq!(
             fold_ranges("{ \"a\": [\n    1,\n    2\n] }"),
-            vec![fr(0, 2, FoldKind::Array)]
+            vec![fr(0, 2, FoldKind::Array, 2)]
         );
     }
 
@@ -1065,9 +1101,9 @@ mod tests {
         assert_eq!(
             fold_ranges(text),
             vec![
-                fr(0, 3, FoldKind::Object),
-                fr(0, 1, FoldKind::Array),
-                fr(2, 3, FoldKind::Array),
+                fr(0, 3, FoldKind::Object, 1),
+                fr(0, 1, FoldKind::Array, 2),
+                fr(2, 3, FoldKind::Array, 2),
             ]
         );
     }
@@ -1078,9 +1114,9 @@ mod tests {
         assert_eq!(
             fold_ranges(&crlf),
             vec![
-                fr(0, 7, FoldKind::Object),
-                fr(1, 6, FoldKind::Object),
-                fr(2, 4, FoldKind::Array),
+                fr(0, 7, FoldKind::Object, 1),
+                fr(1, 6, FoldKind::Object, 2),
+                fr(2, 4, FoldKind::Array, 3),
             ]
         );
     }
@@ -1091,7 +1127,7 @@ mod tests {
         // scanner must agree or fold lines drift from buffer lines.
         assert_eq!(
             fold_ranges("{\n\r\"a\": 1\n\r}"),
-            vec![fr(0, 1, FoldKind::Object)]
+            vec![fr(0, 1, FoldKind::Object, 1)]
         );
     }
 
@@ -1127,14 +1163,14 @@ mod tests {
         assert_eq!(
             fold_ranges(text),
             vec![
-                fr(0, 21, FoldKind::Object),
-                fr(1, 20, FoldKind::Array),
-                fr(2, 19, FoldKind::Object),
-                fr(3, 5, FoldKind::Object),
-                fr(7, 18, FoldKind::Object),
-                fr(8, 16, FoldKind::Array),
-                fr(9, 11, FoldKind::Object),
-                fr(13, 15, FoldKind::Object),
+                fr(0, 21, FoldKind::Object, 1),
+                fr(1, 20, FoldKind::Array, 2),
+                fr(2, 19, FoldKind::Object, 3),
+                fr(3, 5, FoldKind::Object, 4),
+                fr(7, 18, FoldKind::Object, 4),
+                fr(8, 16, FoldKind::Array, 5),
+                fr(9, 11, FoldKind::Object, 6),
+                fr(13, 15, FoldKind::Object, 6),
             ]
         );
     }
@@ -1170,6 +1206,7 @@ mod tests {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     const INDENT: &str = "  ";
 
@@ -1497,6 +1534,81 @@ mod tree_tests {
         let valid = format!("{}1{}", "[".repeat(500), "]".repeat(500));
         let out = pretty_print(&valid, INDENT).expect("valid deep doc");
         assert_eq!(raw_tokens(&valid), raw_tokens(&out));
+    }
+
+    #[test]
+    fn pretty_print_pathological_nesting_bails_fast() {
+        // Deep unclosed nesting reveals its parse error only at EOF, and
+        // per-line indentation grows with the stack depth — without an
+        // output cap a 100KB file of "[" builds ~10GB of indentation
+        // before returning None. The cap must refuse it in linear time.
+        let budget = Duration::from_secs(5);
+
+        let opens = "[".repeat(100_000);
+        let start = Instant::now();
+        assert_eq!(pretty_print(&opens, INDENT), None);
+        assert!(
+            start.elapsed() < budget,
+            "unclosed opens took {:?}",
+            start.elapsed()
+        );
+
+        // Balanced until the last byte: still only detectable at EOF.
+        let mut almost = "[".repeat(30_000);
+        almost.push_str(&"]".repeat(29_999));
+        let start = Instant::now();
+        assert_eq!(pretty_print(&almost, INDENT), None);
+        assert!(
+            start.elapsed() < budget,
+            "almost-closed doc took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn pretty_print_refuses_output_blowup_of_valid_nesting() {
+        // Valid but pathologically deep: the formatted size explodes
+        // quadratically (20k levels of two-space indentation ≈ 800MB from
+        // a 40KB input). The same output cap refuses it outright instead
+        // of ballooning the UI thread; moderate depth (the 500-level doc
+        // above) keeps formatting.
+        let valid = format!("{}1{}", "[".repeat(20_000), "]".repeat(20_000));
+        let start = Instant::now();
+        // Not assert_eq: a regression here would format the failure
+        // message with the ~800MB Some(...) value.
+        assert!(
+            pretty_print(&valid, INDENT).is_none(),
+            "output past the cap must be refused"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "capped doc took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn pretty_print_real_export_stays_far_under_cap() {
+        // The flagship Format input — the 12MB single-line Ghost export —
+        // must never come anywhere near the output cap. Machine-local
+        // fixture, read-only; skip where it does not exist.
+        let path = "/home/lcstyle/Downloads/genzed-guerrillas.ghost.2026-02-12-05-11-07.json";
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present");
+            return;
+        };
+        let out = pretty_print(&text, INDENT).expect("real export must format");
+        assert!(
+            out.len() <= text.len().saturating_mul(PRETTY_PRINT_MAX_GROWTH) / 2,
+            "cap headroom eroded: {} bytes in, {} bytes out",
+            text.len(),
+            out.len()
+        );
+        assert_eq!(
+            raw_tokens(&text),
+            raw_tokens(&out),
+            "formatting may only change whitespace between tokens"
+        );
     }
 
     #[test]
