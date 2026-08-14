@@ -1519,8 +1519,7 @@ dependencies = [
 [[package]]
 name = "cosmic-text"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
+source = "git+https://github.com/Lcstyle/cosmic-text?branch=feature%2Fline-visibility#c1cf7ca9cb33c53cf03f8a6e8f9bb8fc4928a746"
 dependencies = [
  "bitflags 2.13.1",
  "cosmic_undo_2",

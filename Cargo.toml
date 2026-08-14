@@ -73,3 +73,6 @@ debug = true
 
 # [patch."https://github.com/pop-os/cosmic-files.git"]
 # cosmic-files = { git = "https://github.com/pop-os/cosmic-files//", branch = "theme-v2" }
+
+[patch.crates-io]
+cosmic-text = { git = "https://github.com/Lcstyle/cosmic-text", branch = "feature/line-visibility" }
